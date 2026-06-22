@@ -9,10 +9,9 @@ import zipfile
 from pathlib import Path
 
 APP_NAME = "ai-prompt-organizer"
-APP_VERSION = "v1.0.2"
+APP_VERSION = "v1.1.0"
 ROOT_DIR = Path(__file__).resolve().parent
-SOURCE_VERSIONED = ROOT_DIR / f"{APP_NAME}-{APP_VERSION}.py"
-SOURCE_PLAIN = ROOT_DIR / f"{APP_NAME}.py"
+SOURCE_SCRIPT = ROOT_DIR / f"{APP_NAME}.py"
 OUTPUT_DIR = ROOT_DIR / APP_NAME
 ZIP_PATH = ROOT_DIR / f"{APP_NAME}-{APP_VERSION}.zip"
 BUILD_DIR = ROOT_DIR / "build"
@@ -64,14 +63,9 @@ def ensure_pyinstaller() -> None:
 
 
 def find_source_script() -> Path:
-    if SOURCE_VERSIONED.exists():
-        return SOURCE_VERSIONED
-    if SOURCE_PLAIN.exists():
-        return SOURCE_PLAIN
-    fail(
-        "Source script was not found. Put one of these files next to this build script: "
-        f"{SOURCE_VERSIONED.name} or {SOURCE_PLAIN.name}"
-    )
+    if SOURCE_SCRIPT.exists():
+        return SOURCE_SCRIPT
+    fail(f"Source script was not found: {SOURCE_SCRIPT.name}")
     raise AssertionError("unreachable")
 
 
@@ -103,8 +97,7 @@ def build_exe(source_script: Path) -> None:
         str(source_script),
     ]
 
-    log("[INFO] Running PyInstaller without cmd line-continuation.")
-    log("[INFO] This avoids BAT caret/quote problems.")
+    log("[INFO] Building EXE with PyInstaller...")
     result = subprocess.run(command, env=env)
     if result.returncode != 0:
         fail("PyInstaller build failed.")
@@ -156,7 +149,6 @@ def main() -> int:
         remove_path(path)
 
     log("")
-    log("[INFO] Building EXE...")
     build_exe(source_script)
 
     log("")

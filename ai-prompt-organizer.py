@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-AI Prompt Organizer v10
+AI Prompt Organizer v11
 
 AI生成用プロンプトを、タイトル・タグ・説明・画像付きで管理するローカルGUIツール。
 PySide6 + SQLite で動作します。
@@ -103,6 +103,14 @@ DEFAULT_TAG_PRESETS = {
     "Layer Breaker背景": ["画像", "Layer Breaker", "背景"],
     "ちゃっぴー": ["ちゃっぴー", "キャラ"],
 }
+
+META_OPTION_FIELDS = ("engine", "model", "project")
+META_OPTION_LABELS = {
+    "engine": "生成AI",
+    "model": "モデル",
+    "project": "プロジェクト",
+}
+META_OPTION_FIELDS_BY_LABEL = {value: key for key, value in META_OPTION_LABELS.items()}
 
 
 @dataclass
@@ -215,8 +223,20 @@ class Database:
             )
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS meta_options (
+                field TEXT NOT NULL,
+                value TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(field, value)
+            )
+            """
+        )
         self.conn.commit()
         self.seed_defaults_if_needed()
+        self.seed_meta_options_from_prompts_if_needed()
 
     def seed_defaults_if_needed(self) -> None:
         """Seed default tags only for a brand-new database.
@@ -622,6 +642,82 @@ class Database:
         self.conn.execute("DELETE FROM tag_presets WHERE id = ?", (preset_id,))
         self.conn.commit()
 
+    def seed_meta_options_from_prompts_if_needed(self) -> None:
+        if self.get_setting("meta_options_seeded_from_prompts_v1", "") == "1":
+            return
+        for field in META_OPTION_FIELDS:
+            rows = self.conn.execute(
+                f"SELECT DISTINCT {field} AS value FROM prompts WHERE TRIM({field}) != ''"
+            ).fetchall()
+            for row in rows:
+                self.ensure_meta_option(field, str(row["value"]), commit=False)
+        self.set_setting("meta_options_seeded_from_prompts_v1", "1")
+        self.conn.commit()
+
+    def ensure_meta_option(self, field: str, value: str, commit: bool = True) -> None:
+        field = normalize_meta_field(field)
+        value = normalize_meta_value(value)
+        if not field or not value:
+            return
+        now = self.now()
+        self.conn.execute(
+            """
+            INSERT INTO meta_options(field, value, created_at, updated_at)
+            VALUES(?, ?, ?, ?)
+            ON CONFLICT(field, value) DO UPDATE SET updated_at = excluded.updated_at
+            """,
+            (field, value, now, now),
+        )
+        if commit:
+            self.conn.commit()
+
+    def ensure_meta_options_from_prompt_data(self, data: dict) -> None:
+        for field in META_OPTION_FIELDS:
+            self.ensure_meta_option(field, str(data.get(field, "") or ""), commit=False)
+        self.conn.commit()
+
+    def list_meta_options(self, field: str | None = None) -> list[sqlite3.Row]:
+        if field:
+            field = normalize_meta_field(field)
+            return self.conn.execute(
+                "SELECT field, value FROM meta_options WHERE field = ? ORDER BY value COLLATE NOCASE",
+                (field,),
+            ).fetchall()
+        return self.conn.execute(
+            "SELECT field, value FROM meta_options ORDER BY field, value COLLATE NOCASE"
+        ).fetchall()
+
+    def save_meta_option(self, old_field: str | None, old_value: str | None, field: str, value: str) -> None:
+        field = normalize_meta_field(field)
+        value = normalize_meta_value(value)
+        if not field or not value:
+            raise ValueError("入力候補の種類または値が空です。")
+        old_field = normalize_meta_field(old_field or "")
+        old_value = normalize_meta_value(old_value or "")
+        now = self.now()
+        cur = self.conn.cursor()
+        if old_field and old_value and (old_field != field or old_value != value):
+            cur.execute("DELETE FROM meta_options WHERE field = ? AND value = ?", (old_field, old_value))
+            if old_field in META_OPTION_FIELDS:
+                cur.execute(f"UPDATE prompts SET {old_field} = ? WHERE {old_field} = ?", (value, old_value))
+        cur.execute(
+            """
+            INSERT INTO meta_options(field, value, created_at, updated_at)
+            VALUES(?, ?, ?, ?)
+            ON CONFLICT(field, value) DO UPDATE SET updated_at = excluded.updated_at
+            """,
+            (field, value, now, now),
+        )
+        self.conn.commit()
+
+    def delete_meta_option(self, field: str, value: str) -> None:
+        field = normalize_meta_field(field)
+        value = normalize_meta_value(value)
+        if not field or not value:
+            return
+        self.conn.execute("DELETE FROM meta_options WHERE field = ? AND value = ?", (field, value))
+        self.conn.commit()
+
 
 class FlowLayout(QLayout):
     def __init__(self, parent: Optional[QWidget] = None, margin: int = 0, spacing: int = 6):
@@ -701,28 +797,30 @@ class FlowLayout(QLayout):
 class TagChipEditor(QWidget):
     tagsChanged = Signal()
 
-    def __init__(self, color_provider: Callable[[str], str], parent: Optional[QWidget] = None):
+    def __init__(self, color_provider: Callable[[str], str], parent: Optional[QWidget] = None, standalone_layout: bool = True):
         super().__init__(parent)
         self.color_provider = color_provider
         self.tags: list[str] = []
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(5)
 
-        add_row = QHBoxLayout()
-        add_row.setContentsMargins(0, 0, 0, 0)
         self.input_edit = QLineEdit()
         self.input_edit.setPlaceholderText("タグを入力して... / Enter・カンマ区切り可")
         self.add_button = QPushButton("追加")
-        add_row.addWidget(self.input_edit, 1)
-        add_row.addWidget(self.add_button)
-        root.addLayout(add_row)
-
         self.chip_container = QWidget()
         self.flow = FlowLayout(self.chip_container, margin=0, spacing=6)
         self.chip_container.setLayout(self.flow)
         self.chip_container.setMinimumHeight(30)
-        root.addWidget(self.chip_container)
+
+        if standalone_layout:
+            root = QVBoxLayout(self)
+            root.setContentsMargins(0, 0, 0, 0)
+            root.setSpacing(5)
+            add_row = QHBoxLayout()
+            add_row.setContentsMargins(0, 0, 0, 0)
+            add_row.addWidget(self.input_edit, 1)
+            add_row.addWidget(self.add_button)
+            root.addLayout(add_row)
+            root.addWidget(self.chip_container)
+
         self.input_edit.returnPressed.connect(self.add_from_input)
         self.add_button.clicked.connect(self.add_from_input)
 
@@ -771,12 +869,57 @@ class TagChipEditor(QWidget):
         for tag in self.tags:
             btn = QToolButton()
             btn.setText(f"{tag}  ×")
-            btn.setToolTip("クリックでタグを外す")
             btn.setAutoRaise(False)
             btn.setStyleSheet(chip_style(self.color_provider(tag), checked=True))
             btn.clicked.connect(lambda _checked=False, t=tag: self.remove_tag(t))
             self.flow.addWidget(btn)
         self.chip_container.updateGeometry()
+
+
+class PromptListItemWidget(QWidget):
+    def __init__(self, row: PromptRow, icon_size: QSize, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setAutoFillBackground(False)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(8)
+
+        icon_label = QLabel()
+        icon_label.setFixedSize(icon_size)
+        icon_label.setAlignment(Qt.AlignCenter)
+        pix = pixmap_from_path(row.cover_thumb, icon_size)
+        if pix is not None:
+            icon_label.setPixmap(pix)
+        layout.addWidget(icon_label)
+
+        text_layout = QVBoxLayout()
+        text_layout.setContentsMargins(0, 0, 0, 0)
+        text_layout.setSpacing(2)
+
+        title = row.title or "(無題)"
+        fav = "★ " if row.favorite else ""
+        self.title_label = QLabel(f"{fav}{title}")
+        font = self.title_label.font()
+        font.setBold(True)
+        self.title_label.setFont(font)
+        self.title_label.setTextInteractionFlags(Qt.NoTextInteraction)
+        text_layout.addWidget(self.title_label)
+
+        rating = "★" * row.rating if row.rating else ""
+        sub = "  ".join(part for part in [row.project, row.engine, rating] if part)
+        if sub:
+            sub_label = QLabel(sub)
+            sub_label.setTextInteractionFlags(Qt.NoTextInteraction)
+            text_layout.addWidget(sub_label)
+
+        tags_label = " / ".join(row.tags[:5])
+        if tags_label:
+            tag_label = QLabel(tags_label)
+            tag_label.setTextInteractionFlags(Qt.NoTextInteraction)
+            text_layout.addWidget(tag_label)
+
+        text_layout.addStretch(1)
+        layout.addLayout(text_layout, 1)
 
 
 class ImageListWidget(QListWidget):
@@ -825,7 +968,6 @@ class CollapsibleGroupBox(QGroupBox):
         self._collapsed = False
         self._saved_maximum_height = self.maximumHeight()
         self.setTitle(f"▼ {self.plain_title}")
-        self.setToolTip("グループ名をクリックすると折りたたみます。")
 
     def is_collapsed(self) -> bool:
         return self._collapsed
@@ -884,12 +1026,15 @@ class TagManagerDialog(QDialog):
         self.color_provider = color_provider
         self.current_tag_id: Optional[int] = None
         self.current_preset_id: Optional[int] = None
+        self.current_meta_field: str = ""
+        self.current_meta_value: str = ""
         self.setWindowTitle("タグ管理")
         self.resize(900, 620)
         self.build_ui()
         self.refresh_categories()
         self.refresh_tag_list()
         self.refresh_preset_list()
+        self.refresh_meta_option_list()
 
     def build_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -963,6 +1108,34 @@ class TagManagerDialog(QDialog):
         preset_root.addWidget(preset_form_box, 2)
         tabs.addTab(preset_tab, "タグプリセット")
 
+        meta_tab = QWidget()
+        meta_root = QHBoxLayout(meta_tab)
+        self.meta_option_list = QListWidget()
+        self.meta_option_list.setMinimumWidth(290)
+        meta_root.addWidget(self.meta_option_list, 1)
+
+        meta_form_box = QGroupBox("入力候補編集")
+        meta_form = QGridLayout(meta_form_box)
+        self.meta_field_combo = QComboBox()
+        self.meta_field_combo.addItems([META_OPTION_LABELS[field] for field in META_OPTION_FIELDS])
+        self.meta_value_edit = QLineEdit()
+        self.new_meta_option_button = QPushButton("新規")
+        self.save_meta_option_button = QPushButton("保存")
+        self.delete_meta_option_button = QPushButton("削除")
+        meta_form.addWidget(QLabel("種類"), 0, 0)
+        meta_form.addWidget(self.meta_field_combo, 0, 1, 1, 3)
+        meta_form.addWidget(QLabel("値"), 1, 0)
+        meta_form.addWidget(self.meta_value_edit, 1, 1, 1, 3)
+        meta_btn_row = QHBoxLayout()
+        meta_btn_row.addWidget(self.new_meta_option_button)
+        meta_btn_row.addWidget(self.save_meta_option_button)
+        meta_btn_row.addWidget(self.delete_meta_option_button)
+        meta_btn_row.addStretch(1)
+        meta_form.addLayout(meta_btn_row, 2, 0, 1, 4)
+        meta_form.setRowStretch(3, 1)
+        meta_root.addWidget(meta_form_box, 2)
+        tabs.addTab(meta_tab, "入力候補")
+
         close_button = QPushButton("閉じる")
         close_button.clicked.connect(self.accept)
         root.addWidget(close_button, alignment=Qt.AlignRight)
@@ -979,6 +1152,11 @@ class TagManagerDialog(QDialog):
         self.new_preset_button.clicked.connect(self.new_preset)
         self.save_preset_button.clicked.connect(self.save_preset)
         self.delete_preset_button.clicked.connect(self.delete_preset)
+
+        self.meta_option_list.currentItemChanged.connect(self.on_meta_option_selected)
+        self.new_meta_option_button.clicked.connect(self.new_meta_option)
+        self.save_meta_option_button.clicked.connect(self.save_meta_option)
+        self.delete_meta_option_button.clicked.connect(self.delete_meta_option)
 
     def refresh_categories(self) -> None:
         current = self.tag_category_combo.currentText().strip()
@@ -1141,6 +1319,72 @@ class TagManagerDialog(QDialog):
         self.new_preset()
         self.refresh_preset_list()
 
+    def refresh_meta_option_list(self) -> None:
+        selected = (self.current_meta_field, self.current_meta_value)
+        self.meta_option_list.blockSignals(True)
+        self.meta_option_list.clear()
+        for row in self.db.list_meta_options():
+            field = str(row["field"])
+            value = str(row["value"])
+            item = QListWidgetItem(f"{meta_field_label(field)}: {value}")
+            item.setData(Qt.UserRole, (field, value))
+            self.meta_option_list.addItem(item)
+            if selected == (field, value):
+                self.meta_option_list.setCurrentItem(item)
+        self.meta_option_list.blockSignals(False)
+
+    def on_meta_option_selected(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
+        if current is None:
+            return
+        field, value = current.data(Qt.UserRole)
+        self.current_meta_field = normalize_meta_field(field)
+        self.current_meta_value = normalize_meta_value(value)
+        label = meta_field_label(self.current_meta_field)
+        index = self.meta_field_combo.findText(label)
+        if index >= 0:
+            self.meta_field_combo.setCurrentIndex(index)
+        self.meta_value_edit.setText(self.current_meta_value)
+
+    def new_meta_option(self) -> None:
+        self.current_meta_field = ""
+        self.current_meta_value = ""
+        self.meta_option_list.clearSelection()
+        if self.meta_field_combo.count() > 0:
+            self.meta_field_combo.setCurrentIndex(0)
+        self.meta_value_edit.clear()
+        self.meta_value_edit.setFocus()
+
+    def save_meta_option(self) -> None:
+        try:
+            field = normalize_meta_field(self.meta_field_combo.currentText())
+            value = self.meta_value_edit.text()
+            self.db.save_meta_option(self.current_meta_field, self.current_meta_value, field, value)
+            self.current_meta_field = field
+            self.current_meta_value = normalize_meta_value(value)
+            self.refresh_meta_option_list()
+        except sqlite3.IntegrityError as exc:
+            QMessageBox.warning(self, "保存エラー", f"入力候補が重複している可能性があります。\n\n{exc}")
+        except Exception as exc:
+            QMessageBox.warning(self, "保存エラー", str(exc))
+
+    def delete_meta_option(self) -> None:
+        if not self.current_meta_field or not self.current_meta_value:
+            return
+        result = QMessageBox.question(
+            self,
+            "入力候補削除確認",
+            "この入力候補を削除しますか？\n既存プロンプトの入力済みテキストは変更しません。",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if result != QMessageBox.Yes:
+            return
+        self.db.delete_meta_option(self.current_meta_field, self.current_meta_value)
+        self.current_meta_field = ""
+        self.current_meta_value = ""
+        self.new_meta_option()
+        self.refresh_meta_option_list()
+
     def pick_color(self, line_edit: QLineEdit) -> None:
         current = normalize_hex_color(line_edit.text()) or "#777777"
         color = QColorDialog.getColor(QColor(current), self, "色を選択")
@@ -1180,10 +1424,31 @@ class MainWindow(QMainWindow):
         self.connect_signals()
         self.refresh_tags()
         self.reload_preset_combo()
+        self.reload_meta_combos()
         self.apply_font_size(self.font_size_spin.value(), save=False)
         self.restore_ui_state()
         self.refresh_prompt_list()
         self.statusBar().showMessage(f"DB: {self.db_path}")
+
+    def create_editable_combo(self, placeholder: str) -> QComboBox:
+        combo = QComboBox()
+        combo.setEditable(True)
+        combo.setInsertPolicy(QComboBox.NoInsert)
+        line_edit = combo.lineEdit()
+        if line_edit is not None:
+            line_edit.setPlaceholderText(placeholder)
+        return combo
+
+    def reload_meta_combos(self) -> None:
+        for field, combo in [("engine", self.engine_edit), ("model", self.model_edit), ("project", self.project_edit)]:
+            current = combo.currentText()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("")
+            for row in self.db.list_meta_options(field):
+                combo.addItem(str(row["value"]))
+            combo.setCurrentText(current)
+            combo.blockSignals(False)
 
     def build_ui(self) -> None:
         central = QWidget()
@@ -1191,6 +1456,7 @@ class MainWindow(QMainWindow):
         root_layout.setContentsMargins(8, 8, 8, 8)
 
         splitter = QSplitter(Qt.Horizontal)
+        self.main_splitter = splitter
         root_layout.addWidget(splitter, 1)
 
         left = QWidget()
@@ -1199,6 +1465,7 @@ class MainWindow(QMainWindow):
 
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("検索: タイトル / プロンプト / 説明 / タグ")
+        self.search_edit.setClearButtonEnabled(True)
         left_layout.addWidget(self.search_edit)
 
         quick_row = QHBoxLayout()
@@ -1220,22 +1487,24 @@ class MainWindow(QMainWindow):
         self.tag_filter_scroll.setWidgetResizable(True)
         self.tag_filter_scroll.setWidget(self.tag_filter_content)
         self.tag_filter_scroll.setMinimumHeight(120)
-        self.tag_filter_scroll.setMaximumHeight(230)
         tag_layout.addWidget(self.tag_filter_scroll)
         tag_btn_row = QHBoxLayout()
-        self.clear_tags_button = QPushButton("タグ解除")
+        self.clear_tags_button = QPushButton("解除")
         self.only_favorite_checkbox = QCheckBox("お気に入りのみ")
         tag_btn_row.addWidget(self.clear_tags_button)
         tag_btn_row.addWidget(self.only_favorite_checkbox)
         tag_layout.addLayout(tag_btn_row)
-        left_layout.addWidget(tag_box)
-
         self.prompt_list = QListWidget()
         self.prompt_list.setIconSize(QSize(96, 72))
         self.prompt_list.setUniformItemSizes(False)
         self.prompt_list.setSpacing(4)
         self.prompt_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        left_layout.addWidget(self.prompt_list, 1)
+
+        self.left_splitter = QSplitter(Qt.Vertical)
+        self.left_splitter.addWidget(tag_box)
+        self.left_splitter.addWidget(self.prompt_list)
+        self.left_splitter.setSizes([260, 540])
+        left_layout.addWidget(self.left_splitter, 1)
 
         splitter.addWidget(left)
 
@@ -1276,13 +1545,10 @@ class MainWindow(QMainWindow):
         self.favorite_check = QCheckBox("お気に入り")
         self.rating_combo = QComboBox()
         self.rating_combo.addItems(["評価なし", "★", "★★", "★★★", "★★★★", "★★★★★"])
-        self.engine_edit = QLineEdit()
-        self.engine_edit.setPlaceholderText("例: ChatGPT / Gemini / Grok / Midjourney")
-        self.model_edit = QLineEdit()
-        self.model_edit.setPlaceholderText("例: GPT-Image / Imagen / Flux など")
-        self.project_edit = QLineEdit()
-        self.project_edit.setPlaceholderText("例: Layer Breaker / ちゃっぴー")
-        self.tags_editor = TagChipEditor(color_provider=self.tag_color_for_name)
+        self.engine_edit = self.create_editable_combo("例: ChatGPT / Gemini / Grok / Midjourney")
+        self.model_edit = self.create_editable_combo("例: GPT-Image / Imagen / Flux など")
+        self.project_edit = self.create_editable_combo("例: Layer Breaker / ちゃっぴー")
+        self.tags_editor = TagChipEditor(color_provider=self.tag_color_for_name, standalone_layout=False)
         self.preset_combo = QComboBox()
         self.preset_combo.addItem("タグプリセットを追加...")
         self.add_preset_button = QPushButton("追加")
@@ -1300,10 +1566,20 @@ class MainWindow(QMainWindow):
         meta_layout.addWidget(self.project_edit, 1, 5, 1, 3)
         tag_label = QLabel("タグ")
         tag_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        tag_control = QWidget()
+        tag_control_layout = QVBoxLayout(tag_control)
+        tag_control_layout.setContentsMargins(0, 0, 0, 0)
+        tag_control_layout.setSpacing(5)
+        tag_top_row = QHBoxLayout()
+        tag_top_row.setContentsMargins(0, 0, 0, 0)
+        tag_top_row.addWidget(self.tags_editor.input_edit, 1)
+        tag_top_row.addWidget(self.tags_editor.add_button)
+        tag_top_row.addWidget(self.preset_combo)
+        tag_top_row.addWidget(self.add_preset_button)
+        tag_control_layout.addLayout(tag_top_row)
+        tag_control_layout.addWidget(self.tags_editor.chip_container)
         meta_layout.addWidget(tag_label, 2, 0)
-        meta_layout.addWidget(self.tags_editor, 2, 1, 1, 4)
-        meta_layout.addWidget(self.preset_combo, 2, 5, 1, 2, Qt.AlignTop)
-        meta_layout.addWidget(self.add_preset_button, 2, 7, 1, 1, Qt.AlignTop)
+        meta_layout.addWidget(tag_control, 2, 1, 1, 7)
         form_root.addWidget(meta_group)
 
         prompt_group = CollapsibleGroupBox("プロンプト", "section_prompt_collapsed")
@@ -1383,7 +1659,8 @@ class MainWindow(QMainWindow):
 
         edit_menu = self.menuBar().addMenu("編集")
         copy_prompt_action = QAction("プロンプトをコピー", self)
-        copy_prompt_action.setShortcut(QKeySequence.Copy)
+        copy_prompt_action.setShortcut(QKeySequence("Alt+C"))
+        copy_prompt_action.setShortcutContext(Qt.ApplicationShortcut)
         copy_prompt_action.triggered.connect(self.copy_prompt)
         duplicate_action = QAction("複製", self)
         duplicate_action.triggered.connect(self.duplicate_prompt)
@@ -1397,6 +1674,7 @@ class MainWindow(QMainWindow):
     def connect_signals(self) -> None:
         self.search_edit.textChanged.connect(self.refresh_prompt_list)
         self.prompt_list.currentItemChanged.connect(self.on_prompt_selected)
+        self.prompt_list.itemDoubleClicked.connect(lambda _item: self.copy_prompt())
         self.clear_tags_button.clicked.connect(self.clear_tag_filters)
         self.only_favorite_checkbox.stateChanged.connect(self.refresh_prompt_list)
         self.font_size_spin.valueChanged.connect(self.on_font_size_changed)
@@ -1420,13 +1698,13 @@ class MainWindow(QMainWindow):
         self.open_image_button.clicked.connect(self.open_selected_image)
         self.image_list.itemDoubleClicked.connect(lambda _item: self.open_selected_image())
 
-        for widget in [
-            self.title_edit,
+        self.title_edit.textChanged.connect(self.mark_dirty)
+        for combo in [
             self.engine_edit,
             self.model_edit,
             self.project_edit,
         ]:
-            widget.textChanged.connect(self.mark_dirty)
+            combo.currentTextChanged.connect(self.mark_dirty)
         self.tags_editor.tagsChanged.connect(self.mark_dirty)
         self.favorite_check.stateChanged.connect(self.mark_dirty)
         self.rating_combo.currentIndexChanged.connect(self.mark_dirty)
@@ -1472,9 +1750,26 @@ class MainWindow(QMainWindow):
                     self.setWindowState(self.windowState() | Qt.WindowMaximized)
             except Exception:
                 pass
+        self.restore_splitter_sizes()
         for section in self.collapsible_sections:
             collapsed = self.db.get_setting(section.state_key, "0") == "1"
             section.set_collapsed(collapsed, emit_signal=False)
+
+    def restore_splitter_sizes(self) -> None:
+        for key, splitter in [("main_splitter_sizes", self.main_splitter), ("left_splitter_sizes", self.left_splitter)]:
+            raw = self.db.get_setting(key, "")
+            if not raw:
+                continue
+            try:
+                sizes = json.loads(raw)
+                if isinstance(sizes, list) and all(isinstance(v, int) for v in sizes):
+                    splitter.setSizes(sizes)
+            except Exception:
+                pass
+
+    def save_splitter_sizes(self) -> None:
+        self.db.set_setting("main_splitter_sizes", json.dumps(self.main_splitter.sizes()))
+        self.db.set_setting("left_splitter_sizes", json.dumps(self.left_splitter.sizes()))
 
     def save_ui_state(self) -> None:
         geom = self.normalGeometry() if self.isMaximized() else self.geometry()
@@ -1486,6 +1781,7 @@ class MainWindow(QMainWindow):
             "maximized": self.isMaximized(),
         }
         self.db.set_setting("window_geometry", json.dumps(data, ensure_ascii=False))
+        self.save_splitter_sizes()
         for section in self.collapsible_sections:
             self.db.set_setting(section.state_key, "1" if section.is_collapsed() else "0")
 
@@ -1592,22 +1888,18 @@ class MainWindow(QMainWindow):
             if query and query not in haystack:
                 continue
 
-            tags_label = " / ".join(row.tags[:5])
-            fav = "★ " if row.favorite else ""
-            rating = "★" * row.rating if row.rating else ""
-            lines = [f"{fav}{row.title or '(無題)'}"]
-            sub = "  ".join(part for part in [row.project, row.engine, rating] if part)
-            if sub:
-                lines.append(sub)
-            if tags_label:
-                lines.append(tags_label)
-            item = QListWidgetItem("\n".join(lines))
+            item = QListWidgetItem()
+            # The visible row is drawn by PromptListItemWidget.
+            # Keep the QListWidgetItem display text empty so Qt's default item text
+            # does not bleed into the reserved thumbnail area behind the custom widget.
+            item.setText("")
             item.setData(Qt.UserRole, row.id)
+            item.setData(Qt.UserRole + 1, row.title or "(無題)")
             item.setToolTip(f"更新: {row.updated_at}\nタグ: {', '.join(row.tags)}")
-            icon = icon_from_path(row.cover_thumb, QSize(96, 72))
-            if not icon.isNull():
-                item.setIcon(icon)
+            widget = PromptListItemWidget(row, QSize(72, 72))
+            item.setSizeHint(widget.sizeHint())
             self.prompt_list.addItem(item)
+            self.prompt_list.setItemWidget(item, widget)
             if current_id == row.id:
                 self.prompt_list.setCurrentItem(item)
             matched_count += 1
@@ -1621,7 +1913,10 @@ class MainWindow(QMainWindow):
             tag_name = str(button.property("tag_name") or "")
             button.setStyleSheet(chip_style(self.tag_color_for_name(tag_name), checked=False))
         self.tag_list_loading = False
-        self.refresh_prompt_list()
+        if self.search_edit.text():
+            self.search_edit.clear()
+        else:
+            self.refresh_prompt_list()
 
     def maybe_save_dirty(self) -> bool:
         if not self.dirty or self.current_prompt_id is None:
@@ -1651,9 +1946,9 @@ class MainWindow(QMainWindow):
         self.loading = True
         self.current_prompt_id = None
         self.title_edit.clear()
-        self.engine_edit.clear()
-        self.model_edit.clear()
-        self.project_edit.clear()
+        self.engine_edit.setCurrentText("")
+        self.model_edit.setCurrentText("")
+        self.project_edit.setCurrentText("")
         self.tags_editor.set_tags([])
         self.favorite_check.setChecked(False)
         self.rating_combo.setCurrentIndex(0)
@@ -1671,9 +1966,9 @@ class MainWindow(QMainWindow):
         self.loading = True
         self.current_prompt_id = prompt_id
         self.title_edit.setText(str(row["title"]))
-        self.engine_edit.setText(str(row["engine"]))
-        self.model_edit.setText(str(row["model"]))
-        self.project_edit.setText(str(row["project"]))
+        self.engine_edit.setCurrentText(str(row["engine"]))
+        self.model_edit.setCurrentText(str(row["model"]))
+        self.project_edit.setCurrentText(str(row["project"]))
         self.tags_editor.set_tags(self.db.list_prompt_tags(prompt_id))
         self.favorite_check.setChecked(bool(row["favorite"]))
         rating = max(0, min(5, int(row["rating"])))
@@ -1692,9 +1987,9 @@ class MainWindow(QMainWindow):
             "prompt": self.prompt_edit.toPlainText(),
             "negative_prompt": self.negative_edit.toPlainText(),
             "description": self.description_edit.toPlainText(),
-            "engine": self.engine_edit.text().strip(),
-            "model": self.model_edit.text().strip(),
-            "project": self.project_edit.text().strip(),
+            "engine": self.engine_edit.currentText().strip(),
+            "model": self.model_edit.currentText().strip(),
+            "project": self.project_edit.currentText().strip(),
             "rating": self.rating_combo.currentIndex(),
             "favorite": 1 if self.favorite_check.isChecked() else 0,
         }
@@ -1706,9 +2001,11 @@ class MainWindow(QMainWindow):
         else:
             self.db.update_prompt(self.current_prompt_id, data)
         self.db.set_prompt_tags(self.current_prompt_id, self.tags_editor.get_tags())
+        self.db.ensure_meta_options_from_prompt_data(data)
         self.dirty = False
         self.refresh_tags()
         self.reload_preset_combo()
+        self.reload_meta_combos()
         self.refresh_prompt_list()
         self.select_prompt_in_list(self.current_prompt_id)
         self.statusBar().showMessage("保存しました")
@@ -1787,7 +2084,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"削除しました。画像ファイルをゴミ箱へ移動: {moved} 件")
 
     def copy_prompt(self) -> None:
-        text = self.prompt_edit.toPlainText()
+        text = strip_prompt_comment_lines(self.prompt_edit.toPlainText())
         QGuiApplication.clipboard().setText(text)
         self.statusBar().showMessage("プロンプトをコピーしました")
 
@@ -1796,10 +2093,10 @@ class MainWindow(QMainWindow):
         title = self.title_edit.text().strip()
         if title:
             parts.append(f"# {title}")
-        prompt = self.prompt_edit.toPlainText().strip()
+        prompt = strip_prompt_comment_lines(self.prompt_edit.toPlainText()).strip()
         if prompt:
             parts.append(prompt)
-        negative = self.negative_edit.toPlainText().strip()
+        negative = strip_prompt_comment_lines(self.negative_edit.toPlainText()).strip()
         if negative:
             parts.append("\n[Negative / Sub Prompt]\n" + negative)
         QGuiApplication.clipboard().setText("\n\n".join(parts))
@@ -1817,6 +2114,7 @@ class MainWindow(QMainWindow):
         dialog.exec()
         self.refresh_tags()
         self.reload_preset_combo()
+        self.reload_meta_combos()
         if self.current_prompt_id is not None and not self.dirty:
             self.loading = True
             self.tags_editor.set_tags(self.db.list_prompt_tags(self.current_prompt_id))
@@ -2050,6 +2348,23 @@ def normalize_category(category: str) -> str:
     return category
 
 
+def normalize_meta_field(field: str) -> str:
+    field = str(field or "").strip()
+    if field in META_OPTION_LABELS:
+        return field
+    return META_OPTION_FIELDS_BY_LABEL.get(field, "")
+
+
+def normalize_meta_value(value: str) -> str:
+    value = str(value or "").strip()
+    value = re.sub(r"\s+", " ", value)
+    return value
+
+
+def meta_field_label(field: str) -> str:
+    return META_OPTION_LABELS.get(normalize_meta_field(field), str(field or ""))
+
+
 def parse_tags(text: str) -> list[str]:
     parts = re.split(r"[,，、\n]+", text)
     tags: list[str] = []
@@ -2060,6 +2375,16 @@ def parse_tags(text: str) -> list[str]:
             tags.append(tag)
             seen.add(tag)
     return tags
+
+
+def strip_prompt_comment_lines(text: str) -> str:
+    lines: list[str] = []
+    for line in str(text or "").splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("#") or stripped.startswith("＃"):
+            continue
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def tags_from_json(text: str) -> list[str]:
@@ -2288,16 +2613,22 @@ def unique_path(path: Path) -> Path:
 
 
 def icon_from_path(path: str, size: QSize) -> QIcon:
-    if not path:
+    pix = pixmap_from_path(path, size)
+    if pix is None:
         return QIcon()
+    return QIcon(pix)
+
+
+def pixmap_from_path(path: str, size: QSize) -> QPixmap | None:
+    if not path:
+        return None
     p = Path(path)
     if not p.exists():
-        return QIcon()
+        return None
     pix = QPixmap(str(p))
     if pix.isNull():
-        return QIcon()
-    pix = pix.scaled(size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-    return QIcon(pix)
+        return None
+    return pix.scaled(size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
 
 def has_image_urls(mime_data) -> bool:
