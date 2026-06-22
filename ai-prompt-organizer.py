@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-AI Prompt Organizer v11
+AI Prompt Organizer v12
 
 AI生成用プロンプトを、タイトル・タグ・説明・画像付きで管理するローカルGUIツール。
 PySide6 + SQLite で動作します。
 
 必要環境:
-    pip install PySide6
+    pip install PySide6 opencv-python
 
 保存場所:
     スクリプトと同じフォルダに prompt_organizer.db と assets/ を作成します。
@@ -73,6 +73,8 @@ WINDOW_ICON_RELATIVE = ("resources", "icons", "window.png")
 EXE_ICON_RELATIVE = ("resources", "icons", "app.ico")
 DB_FILENAME = "prompt_organizer.db"
 SUPPORTED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
+SUPPORTED_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+SUPPORTED_MEDIA_EXTS = SUPPORTED_IMAGE_EXTS | SUPPORTED_VIDEO_EXTS
 
 
 DEFAULT_CATEGORY_COLORS = {
@@ -937,19 +939,19 @@ class ImageListWidget(QListWidget):
         self.setMinimumHeight(170)
 
     def dragEnterEvent(self, event):  # noqa: N802 - Qt naming
-        if has_image_urls(event.mimeData()):
+        if has_media_urls(event.mimeData()):
             event.acceptProposedAction()
         else:
             super().dragEnterEvent(event)
 
     def dragMoveEvent(self, event):  # noqa: N802 - Qt naming
-        if has_image_urls(event.mimeData()):
+        if has_media_urls(event.mimeData()):
             event.acceptProposedAction()
         else:
             super().dragMoveEvent(event)
 
     def dropEvent(self, event):  # noqa: N802 - Qt naming
-        paths = image_paths_from_mime(event.mimeData())
+        paths = media_paths_from_mime(event.mimeData())
         if paths:
             self.main_window.add_images_from_paths(paths)
             event.acceptProposedAction()
@@ -1613,7 +1615,7 @@ class MainWindow(QMainWindow):
         self.collapsible_sections.append(image_group)
         image_layout = QVBoxLayout(image_group)
         img_btn_row = QHBoxLayout()
-        self.add_images_button = QPushButton("画像を追加")
+        self.add_images_button = QPushButton("画像/動画を追加")
         self.rename_image_button = QPushButton("ファイル名変更")
         self.remove_image_button = QPushButton("選択画像を削除")
         self.cover_image_button = QPushButton("カバーにする")
@@ -1627,7 +1629,7 @@ class MainWindow(QMainWindow):
         image_layout.addLayout(img_btn_row)
         self.image_list = ImageListWidget(self)
         image_layout.addWidget(self.image_list)
-        self.drop_hint_label = QLabel("画像ファイルをここへドラッグ＆ドロップで追加できます。")
+        self.drop_hint_label = QLabel("画像/動画ファイルをここへドラッグ＆ドロップで追加できます。")
         self.drop_hint_label.setStyleSheet("color: #777;")
         image_layout.addWidget(self.drop_hint_label)
         form_root.addWidget(image_group)
@@ -2131,15 +2133,15 @@ class MainWindow(QMainWindow):
     def choose_images(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(
             self,
-            "画像を選択",
+            "画像/動画を選択",
             str(Path.home()),
-            "Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif);;All Files (*.*)",
+            "Media (*.png *.jpg *.jpeg *.webp *.bmp *.gif *.mp4 *.mov *.avi *.mkv *.webm);;Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif);;Videos (*.mp4 *.mov *.avi *.mkv *.webm);;All Files (*.*)",
         )
         if files:
             self.add_images_from_paths([Path(f) for f in files])
 
     def add_images_from_paths(self, paths: Iterable[Path]) -> None:
-        paths = [Path(p) for p in paths if Path(p).suffix.lower() in SUPPORTED_IMAGE_EXTS and Path(p).exists()]
+        paths = [Path(p) for p in paths if Path(p).suffix.lower() in SUPPORTED_MEDIA_EXTS and Path(p).exists()]
         if not paths:
             return
         if not self.ensure_current_prompt_saved_for_images():
@@ -2150,20 +2152,26 @@ class MainWindow(QMainWindow):
         prompt_asset_dir.mkdir(parents=True, exist_ok=True)
         for src in paths:
             try:
-                dest = unique_path(prompt_asset_dir / safe_filename(src.name))
-                if src.resolve() != dest.resolve():
-                    shutil.copy2(src, dest)
+                ext = src.suffix.lower()
+                if ext in SUPPORTED_IMAGE_EXTS:
+                    dest = unique_path(prompt_asset_dir / safe_filename(src.name))
+                    if src.resolve() != dest.resolve():
+                        shutil.copy2(src, dest)
+                elif ext in SUPPORTED_VIDEO_EXTS:
+                    dest = self.generate_video_snapshot(src, prompt_asset_dir)
+                else:
+                    continue
                 image_id = self.db.add_image(self.current_prompt_id, str(dest), "")
                 thumb_path = self.create_thumbnail(dest, image_id)
                 if thumb_path:
                     self.db.update_image_thumbnail(image_id, str(thumb_path))
                 added += 1
             except Exception as exc:
-                QMessageBox.warning(self, "画像追加エラー", f"画像を追加できませんでした。\n{src}\n\n{exc}")
+                QMessageBox.warning(self, "メディア追加エラー", f"メディアを追加できませんでした。\n{src}\n\n{exc}")
         if added:
             self.refresh_images()
             self.refresh_prompt_list()
-            self.statusBar().showMessage(f"画像を {added} 件追加しました")
+            self.statusBar().showMessage(f"メディアを {added} 件追加しました")
 
     def create_thumbnail(self, src: Path, image_id: int) -> Optional[Path]:
         pix = QPixmap(str(src))
@@ -2174,6 +2182,58 @@ class MainWindow(QMainWindow):
         if thumb.save(str(thumb_path), "PNG"):
             return thumb_path
         return None
+
+    def generate_video_snapshot(self, src: Path, prompt_asset_dir: Path) -> Path:
+        try:
+            import cv2  # type: ignore
+        except Exception as exc:
+            raise RuntimeError("動画サムネ生成には opencv-python が必要です。") from exc
+
+        cap = cv2.VideoCapture(str(src))
+        if not cap.isOpened():
+            cap.release()
+            raise RuntimeError("動画を開けませんでした。")
+
+        try:
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            candidate_indexes: list[int] = []
+            if frame_count > 0:
+                candidate_indexes.extend([max(0, int(frame_count * 0.15)), max(0, frame_count // 2), 0])
+            else:
+                candidate_indexes.extend([0])
+
+            frame = None
+            seen: set[int] = set()
+            for index in candidate_indexes:
+                if index in seen:
+                    continue
+                seen.add(index)
+                if frame_count > 0:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, index)
+                ok, current = cap.read()
+                if ok and current is not None:
+                    frame = current
+                    break
+
+            if frame is None:
+                raise RuntimeError("動画からフレームを取得できませんでした。")
+
+            height, width = frame.shape[:2]
+            if height <= 0 or width <= 0:
+                raise RuntimeError("取得したフレームのサイズが不正です。")
+
+            target_height = 1080
+            target_width = max(1, int(round(width * (target_height / float(height)))))
+            if height != target_height:
+                frame = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_AREA if target_height < height else cv2.INTER_CUBIC)
+
+            dest = unique_path(prompt_asset_dir / f"{normalize_file_stem(src.name)}.jpg")
+            ok = cv2.imwrite(str(dest), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+            if not ok:
+                raise RuntimeError("JPEGを書き出せませんでした。")
+            return dest
+        finally:
+            cap.release()
 
     def refresh_images(self) -> None:
         self.image_list.clear()
@@ -2303,19 +2363,19 @@ class MainWindow(QMainWindow):
         open_path(folder)
 
     def dragEnterEvent(self, event):  # noqa: N802 - Qt naming
-        if has_image_urls(event.mimeData()):
+        if has_media_urls(event.mimeData()):
             event.acceptProposedAction()
         else:
             super().dragEnterEvent(event)
 
     def dragMoveEvent(self, event):  # noqa: N802 - Qt naming
-        if has_image_urls(event.mimeData()):
+        if has_media_urls(event.mimeData()):
             event.acceptProposedAction()
         else:
             super().dragMoveEvent(event)
 
     def dropEvent(self, event):  # noqa: N802 - Qt naming
-        paths = image_paths_from_mime(event.mimeData())
+        paths = media_paths_from_mime(event.mimeData())
         if paths:
             if self.current_prompt_id is None:
                 first = Path(paths[0])
@@ -2631,11 +2691,11 @@ def pixmap_from_path(path: str, size: QSize) -> QPixmap | None:
     return pix.scaled(size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
 
-def has_image_urls(mime_data) -> bool:
-    return bool(image_paths_from_mime(mime_data))
+def has_media_urls(mime_data) -> bool:
+    return bool(media_paths_from_mime(mime_data))
 
 
-def image_paths_from_mime(mime_data) -> list[Path]:
+def media_paths_from_mime(mime_data) -> list[Path]:
     paths: list[Path] = []
     if not mime_data.hasUrls():
         return paths
@@ -2643,7 +2703,7 @@ def image_paths_from_mime(mime_data) -> list[Path]:
         if not url.isLocalFile():
             continue
         path = Path(url.toLocalFile())
-        if path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_EXTS:
+        if path.is_file() and path.suffix.lower() in SUPPORTED_MEDIA_EXTS:
             paths.append(path)
     return paths
 

@@ -9,7 +9,7 @@ import zipfile
 from pathlib import Path
 
 APP_NAME = "ai-prompt-organizer"
-APP_VERSION = "v1.1.0"
+APP_VERSION = "v1.2.0"
 ROOT_DIR = Path(__file__).resolve().parent
 SOURCE_SCRIPT = ROOT_DIR / f"{APP_NAME}.py"
 OUTPUT_DIR = ROOT_DIR / APP_NAME
@@ -45,6 +45,20 @@ def sha256(path: Path) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def ensure_module(package_name: str, import_name: str | None = None) -> None:
+    import_name = import_name or package_name
+    try:
+        __import__(import_name)
+        return
+    except Exception:
+        pass
+
+    log(f"[INFO] {package_name} was not found. Installing...")
+    install = subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", package_name])
+    if install.returncode != 0:
+        fail(f"Failed to install {package_name}.")
 
 
 def ensure_pyinstaller() -> None:
@@ -94,6 +108,10 @@ def build_exe(source_script: Path) -> None:
         str(EXE_ICON),
         "--add-data",
         add_data_arg,
+        "--hidden-import",
+        "cv2",
+        "--collect-all",
+        "cv2",
         str(source_script),
     ]
 
@@ -142,6 +160,7 @@ def main() -> int:
     log(f"[INFO] EXE icon SHA256: {sha256(EXE_ICON)}")
 
     ensure_pyinstaller()
+    ensure_module("opencv-python", "cv2")
 
     log("")
     log("[INFO] Cleaning old build files...")
