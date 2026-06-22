@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-AI Prompt Organizer v9
+AI Prompt Organizer v10
 
 AI生成用プロンプトを、タイトル・タグ・説明・画像付きで管理するローカルGUIツール。
 PySide6 + SQLite で動作します。
@@ -216,7 +216,28 @@ class Database:
             """
         )
         self.conn.commit()
+        self.seed_defaults_if_needed()
+
+    def seed_defaults_if_needed(self) -> None:
+        """Seed default tags only for a brand-new database.
+
+        Older versions called seed_defaults() on every startup. That meant
+        a user-deleted default tag was silently recreated after restart.
+        If this database already has any tags or presets, treat it as an
+        existing user database and only mark the seed as completed.
+        """
+        seeded = self.get_setting("defaults_seeded_v1", "")
+        if seeded == "1":
+            return
+
+        tag_count = int(self.conn.execute("SELECT COUNT(*) FROM tags").fetchone()[0])
+        preset_count = int(self.conn.execute("SELECT COUNT(*) FROM tag_presets").fetchone()[0])
+        if tag_count > 0 or preset_count > 0:
+            self.set_setting("defaults_seeded_v1", "1")
+            return
+
         self.seed_defaults()
+        self.set_setting("defaults_seeded_v1", "1")
 
     def seed_defaults(self) -> None:
         for category, color in DEFAULT_CATEGORY_COLORS.items():
@@ -313,7 +334,26 @@ class Database:
         return int(tag_id)
 
     def delete_tag(self, tag_id: int) -> None:
-        self.conn.execute("DELETE FROM tags WHERE id = ?", (tag_id,))
+        row = self.conn.execute("SELECT name FROM tags WHERE id = ?", (tag_id,)).fetchone()
+        tag_name = normalize_tag(str(row["name"])) if row else ""
+        cur = self.conn.cursor()
+        cur.execute("DELETE FROM tags WHERE id = ?", (tag_id,))
+
+        # Also remove the deleted tag name from presets. Otherwise applying
+        # an old preset later would recreate the tag via ensure_tag().
+        if tag_name:
+            preset_rows = cur.execute("SELECT id, tags_json FROM tag_presets").fetchall()
+            for preset in preset_rows:
+                try:
+                    tags = json.loads(str(preset["tags_json"] or "[]"))
+                except Exception:
+                    tags = []
+                cleaned = [t for t in tags if normalize_tag(str(t)) != tag_name]
+                if cleaned != tags:
+                    cur.execute(
+                        "UPDATE tag_presets SET tags_json = ?, updated_at = ? WHERE id = ?",
+                        (json.dumps(cleaned, ensure_ascii=False), self.now(), int(preset["id"])),
+                    )
         self.conn.commit()
 
     def get_tag(self, tag_id: int) -> sqlite3.Row | None:
@@ -1039,7 +1079,7 @@ class TagManagerDialog(QDialog):
         result = QMessageBox.question(
             self,
             "タグ削除確認",
-            "このタグを削除しますか？\nプロンプトとの紐づけも削除されます。",
+            "このタグを削除しますか？\nプロンプトとの紐づけと、タグプリセット内の同名タグも削除されます。",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -1049,6 +1089,7 @@ class TagManagerDialog(QDialog):
         self.current_tag_id = None
         self.new_tag()
         self.refresh_tag_list()
+        self.refresh_preset_list()
 
     def on_preset_selected(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
         if current is None:

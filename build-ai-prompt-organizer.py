@@ -9,7 +9,7 @@ import zipfile
 from pathlib import Path
 
 APP_NAME = "ai-prompt-organizer"
-APP_VERSION = "v1.0.1"
+APP_VERSION = "v1.0.2"
 ROOT_DIR = Path(__file__).resolve().parent
 SOURCE_VERSIONED = ROOT_DIR / f"{APP_NAME}-{APP_VERSION}.py"
 SOURCE_PLAIN = ROOT_DIR / f"{APP_NAME}.py"
