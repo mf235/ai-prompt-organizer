@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-AI Prompt Organizer v12
+AI Prompt Organizer v13
 
 AI生成用プロンプトを、タイトル・タグ・説明・画像付きで管理するローカルGUIツール。
 PySide6 + SQLite で動作します。
@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 try:
-    from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal
+    from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal, QTimer
     from PySide6.QtGui import QAction, QColor, QGuiApplication, QIcon, QKeySequence, QPixmap
     from PySide6.QtWidgets import (
         QApplication,
@@ -1416,9 +1416,7 @@ class MainWindow(QMainWindow):
         self.collapsible_sections: list[CollapsibleGroupBox] = []
 
         self.setWindowTitle(APP_NAME)
-        window_icon = load_window_icon()
-        if not window_icon.isNull():
-            self.setWindowIcon(window_icon)
+        self.apply_window_icon()
         self.resize(1320, 900)
         self.setAcceptDrops(True)
         self.build_ui()
@@ -1431,6 +1429,15 @@ class MainWindow(QMainWindow):
         self.restore_ui_state()
         self.refresh_prompt_list()
         self.statusBar().showMessage(f"DB: {self.db_path}")
+
+    def apply_window_icon(self) -> None:
+        icon = load_window_icon()
+        if icon.isNull():
+            return
+        app = QApplication.instance()
+        if app is not None:
+            app.setWindowIcon(icon)
+        self.setWindowIcon(icon)
 
     def create_editable_combo(self, placeholder: str) -> QComboBox:
         combo = QComboBox()
@@ -1588,6 +1595,7 @@ class MainWindow(QMainWindow):
         self.collapsible_sections.append(prompt_group)
         prompt_layout = QVBoxLayout(prompt_group)
         self.prompt_edit = QTextEdit()
+        self.prompt_edit.setAcceptRichText(False)
         self.prompt_edit.setPlaceholderText("ここにメインプロンプトを入力")
         self.prompt_edit.setMinimumHeight(190)
         prompt_layout.addWidget(self.prompt_edit)
@@ -1597,6 +1605,7 @@ class MainWindow(QMainWindow):
         self.collapsible_sections.append(negative_group)
         negative_layout = QVBoxLayout(negative_group)
         self.negative_edit = QTextEdit()
+        self.negative_edit.setAcceptRichText(False)
         self.negative_edit.setPlaceholderText("ネガティブプロンプトや補助プロンプト。不要なら空でOK")
         self.negative_edit.setMinimumHeight(90)
         negative_layout.addWidget(self.negative_edit)
@@ -1606,6 +1615,7 @@ class MainWindow(QMainWindow):
         self.collapsible_sections.append(desc_group)
         desc_layout = QVBoxLayout(desc_group)
         self.description_edit = QTextEdit()
+        self.description_edit.setAcceptRichText(False)
         self.description_edit.setPlaceholderText("使いどころ、成功/失敗メモ、修正方針など")
         self.description_edit.setMinimumHeight(110)
         desc_layout.addWidget(self.description_edit)
@@ -2377,11 +2387,6 @@ class MainWindow(QMainWindow):
     def dropEvent(self, event):  # noqa: N802 - Qt naming
         paths = media_paths_from_mime(event.mimeData())
         if paths:
-            if self.current_prompt_id is None:
-                first = Path(paths[0])
-                new_id = self.db.create_prompt(first.stem)
-                self.current_prompt_id = new_id
-                self.load_prompt(new_id)
             self.add_images_from_paths(paths)
             event.acceptProposedAction()
         else:
@@ -2737,6 +2742,8 @@ def main() -> int:
         app.setWindowIcon(app_icon)
     window = MainWindow()
     window.show()
+    QTimer.singleShot(0, window.apply_window_icon)
+    QTimer.singleShot(1000, window.apply_window_icon)
     return app.exec()
 
 
