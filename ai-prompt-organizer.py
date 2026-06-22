@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-AI Prompt Organizer v8
+AI Prompt Organizer v9
 
 AI生成用プロンプトを、タイトル・タグ・説明・画像付きで管理するローカルGUIツール。
 PySide6 + SQLite で動作します。
@@ -1713,18 +1713,37 @@ class MainWindow(QMainWindow):
         result = QMessageBox.question(
             self,
             "削除確認",
-            f"「{title}」を削除しますか？\nDB上の登録を削除します。画像ファイル自体はassets内に残します。",
+            f"「{title}」を削除しますか？\nDB上の登録を削除し、assets内の画像ファイルはWindowsのゴミ箱へ移動します。",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
         if result != QMessageBox.Yes:
             return
+
         deleted_id = self.current_prompt_id
+        image_rows = self.db.list_images(deleted_id)
+        prompt_asset_dir = self.images_dir / f"prompt_{deleted_id:06d}"
+        recycle_targets: list[Path] = []
+        if prompt_asset_dir.exists():
+            recycle_targets.append(prompt_asset_dir)
+        for row in image_rows:
+            file_path = Path(str(row["file_path"]))
+            thumb_path = Path(str(row["thumbnail_path"] or ""))
+            if file_path.exists() and not (prompt_asset_dir.exists() and is_relative_to_path(file_path, prompt_asset_dir)):
+                recycle_targets.append(file_path)
+            if thumb_path.exists():
+                recycle_targets.append(thumb_path)
+
         self.db.delete_prompt(deleted_id)
+        moved, errors = move_paths_to_recycle_bin(recycle_targets)
         self.clear_detail()
         self.refresh_tags()
         self.refresh_prompt_list()
-        self.statusBar().showMessage("削除しました")
+        if errors:
+            QMessageBox.warning(self, "削除警告", "登録は削除しましたが、一部ファイルをゴミ箱へ移動できませんでした。\n\n" + "\n".join(errors[:5]))
+            self.statusBar().showMessage(f"削除しました。一部ファイル移動失敗: {len(errors)} 件")
+        else:
+            self.statusBar().showMessage(f"削除しました。画像ファイルをゴミ箱へ移動: {moved} 件")
 
     def copy_prompt(self) -> None:
         text = self.prompt_edit.toPlainText()
@@ -1883,18 +1902,38 @@ class MainWindow(QMainWindow):
         image_id = self.selected_image_id()
         if image_id is None:
             return
+        row = self.db.get_image(image_id)
+        if not row:
+            return
         result = QMessageBox.question(
             self,
             "画像削除確認",
-            "選択画像の登録を削除しますか？\n画像ファイル自体はassets内に残します。",
+            "選択画像の登録を削除しますか？\n画像ファイルはWindowsのゴミ箱へ移動します。",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
         if result != QMessageBox.Yes:
             return
+
+        recycle_targets = [Path(str(row["file_path"]))]
+        thumb_path = Path(str(row["thumbnail_path"] or ""))
+        if thumb_path.exists():
+            recycle_targets.append(thumb_path)
+
+        prompt_id = int(row["prompt_id"])
         self.db.delete_image(image_id)
+        if not self.db.list_images(prompt_id):
+            prompt_asset_dir = self.images_dir / f"prompt_{prompt_id:06d}"
+            if prompt_asset_dir.exists():
+                recycle_targets.append(prompt_asset_dir)
+        moved, errors = move_paths_to_recycle_bin(recycle_targets)
         self.refresh_images()
         self.refresh_prompt_list()
+        if errors:
+            QMessageBox.warning(self, "画像削除警告", "登録は削除しましたが、一部ファイルをゴミ箱へ移動できませんでした。\n\n" + "\n".join(errors[:5]))
+            self.statusBar().showMessage(f"画像登録を削除しました。一部ファイル移動失敗: {len(errors)} 件")
+        else:
+            self.statusBar().showMessage(f"画像を削除しました。ゴミ箱へ移動: {moved} 件")
 
     def set_selected_image_as_cover(self) -> None:
         if self.current_prompt_id is None:
@@ -2084,6 +2123,100 @@ def set_windows_app_user_model_id() -> None:
     except Exception:
         pass
 
+
+
+def is_relative_to_path(child: Path, parent: Path) -> bool:
+    try:
+        child.resolve().relative_to(parent.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def move_path_to_recycle_bin(path: Path) -> bool:
+    """Move a file/folder to the Windows Recycle Bin. Returns True when something was moved."""
+    path = Path(path)
+    if not path.exists():
+        return False
+
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            FO_DELETE = 3
+            FOF_SILENT = 0x0004
+            FOF_NOCONFIRMATION = 0x0010
+            FOF_ALLOWUNDO = 0x0040
+            FOF_NOERRORUI = 0x0400
+
+            class SHFILEOPSTRUCTW(ctypes.Structure):
+                _fields_ = [
+                    ("hwnd", wintypes.HWND),
+                    ("wFunc", wintypes.UINT),
+                    ("pFrom", wintypes.LPCWSTR),
+                    ("pTo", wintypes.LPCWSTR),
+                    ("fFlags", wintypes.USHORT),
+                    ("fAnyOperationsAborted", wintypes.BOOL),
+                    ("hNameMappings", wintypes.LPVOID),
+                    ("lpszProgressTitle", wintypes.LPCWSTR),
+                ]
+
+            # SHFileOperation requires a double-null-terminated path list.
+            from_path = str(path.resolve()) + "\0\0"
+            op = SHFILEOPSTRUCTW()
+            op.hwnd = None
+            op.wFunc = FO_DELETE
+            op.pFrom = from_path
+            op.pTo = None
+            op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI
+            op.fAnyOperationsAborted = False
+            op.hNameMappings = None
+            op.lpszProgressTitle = None
+
+            result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+            if result != 0 or op.fAnyOperationsAborted:
+                raise OSError(f"SHFileOperationW failed: result={result}, aborted={bool(op.fAnyOperationsAborted)}")
+            return True
+        except Exception:
+            raise
+
+    # This tool is primarily for Windows EXE distribution. Non-Windows fallback keeps behavior simple.
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+    return True
+
+
+def move_paths_to_recycle_bin(paths: Iterable[Path]) -> tuple[int, list[str]]:
+    moved = 0
+    errors: list[str] = []
+    seen: set[str] = set()
+    normalized: list[Path] = []
+    for raw_path in paths:
+        try:
+            path = Path(raw_path)
+            key = str(path.resolve())
+        except Exception:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        if path.exists():
+            normalized.append(path)
+
+    # Move deeper files before parent folders unless the caller intentionally only provides a folder.
+    normalized.sort(key=lambda p: len(p.parts), reverse=True)
+    for path in normalized:
+        if not path.exists():
+            continue
+        try:
+            if move_path_to_recycle_bin(path):
+                moved += 1
+        except Exception as exc:
+            errors.append(f"{path}: {exc}")
+    return moved, errors
 
 def safe_filename(name: str) -> str:
     name = name.strip().replace("\x00", "")
