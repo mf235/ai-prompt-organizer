@@ -9,7 +9,7 @@ import zipfile
 from pathlib import Path
 
 APP_NAME = "ai-prompt-organizer"
-APP_VERSION = "v1.10.0"
+APP_VERSION = "v1.12.1"
 ROOT_DIR = Path(__file__).resolve().parent
 SOURCE_SCRIPT = ROOT_DIR / f"{APP_NAME}.py"
 OUTPUT_DIR = ROOT_DIR / APP_NAME
@@ -135,6 +135,11 @@ def create_zip() -> None:
                 zf.write(file_path, file_path.relative_to(ROOT_DIR))
 
 
+def clean_generated_build_files_after_zip() -> None:
+    for path in [OUTPUT_DIR, BUILD_DIR, DIST_DIR, SPEC_PATH, PYINSTALLER_CACHE_DIR]:
+        remove_path(path)
+
+
 def main() -> int:
     os.chdir(ROOT_DIR)
     log("")
@@ -175,6 +180,10 @@ def main() -> int:
     create_zip()
 
     log("")
+    log("[INFO] Cleaning generated build files after ZIP creation...")
+    clean_generated_build_files_after_zip()
+
+    log("")
     log("========================================")
     log("Build complete")
     log("========================================")
@@ -182,6 +191,7 @@ def main() -> int:
     log("Contents:")
     log(f"  {APP_NAME}/{APP_NAME}.exe")
     log("")
+    log("Generated build folders were cleaned. Only the ZIP is left as the build output.")
     log("If Explorer still shows an old icon, extract the ZIP to a new folder.")
     log("Windows may cache icons by path and exe name.")
     return 0

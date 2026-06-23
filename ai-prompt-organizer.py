@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-AI Prompt Organizer v29
+AI Prompt Organizer v36
 
 AI生成用プロンプトを、タイトル・タグ・説明・画像付きで管理するローカルGUIツール。
 PySide6 + SQLite で動作します。
@@ -28,7 +28,7 @@ from typing import Callable, Iterable, Optional
 
 try:
     from PySide6.QtCore import QLockFile, QMimeData, QPoint, QRect, QSize, Qt, QTimer, QUrl, Signal
-    from PySide6.QtGui import QAction, QActionGroup, QColor, QFont, QGuiApplication, QIcon, QKeySequence, QPainter, QPixmap, QPixmapCache
+    from PySide6.QtGui import QAction, QActionGroup, QColor, QDrag, QFont, QGuiApplication, QIcon, QKeySequence, QPainter, QPixmap, QPixmapCache
     from PySide6.QtWidgets import (
         QApplication,
         QAbstractItemView,
@@ -69,7 +69,7 @@ except Exception as exc:  # pragma: no cover - 実行環境向けメッセージ
 
 
 APP_NAME = "AI Prompt Organizer"
-APP_VERSION = "v1.10.0"
+APP_VERSION = "v1.12.1"
 APP_AUTHOR = "MF235"
 APP_CONTACT_X = "https://x.com/MF235XBR"
 APP_REPOSITORY = "https://github.com/mf235/ai-prompt-organizer"
@@ -77,6 +77,7 @@ APP_USER_MODEL_ID = "chappy.ai-prompt-organizer"
 WINDOW_ICON_RELATIVE = ("resources", "icons", "window.png")
 EXE_ICON_RELATIVE = ("resources", "icons", "app.ico")
 DB_FILENAME = "prompt_organizer.db"
+INTERNAL_MATERIAL_DRAG_MIME = "application/x-ai-prompt-organizer-material-drag"
 BACKUP_DIR_NAME = "_backup"
 SUPPORTED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
 SUPPORTED_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
@@ -1014,8 +1015,12 @@ class ImageListWidget(QListWidget):
     def __init__(self, main_window: "MainWindow"):
         super().__init__()
         self.main_window = main_window
+        self._drag_start_pos: Optional[QPoint] = None
+        self._drag_start_item: Optional[QListWidgetItem] = None
         self.setAcceptDrops(True)
-        self.setDragDropMode(QAbstractItemView.DropOnly)
+        self.setDragEnabled(True)
+        self.setDragDropMode(QAbstractItemView.DragDrop)
+        self.setDefaultDropAction(Qt.CopyAction)
         self.setViewMode(QListWidget.IconMode)
         self.setIconSize(QSize(140, 105))
         self.setGridSize(QSize(170, 150))
@@ -1026,6 +1031,51 @@ class ImageListWidget(QListWidget):
         self.setSelectionMode(QAbstractItemView.SingleSelection)
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.setMinimumHeight(170)
+
+    def event_local_pos(self, event) -> QPoint:
+        if hasattr(event, "position"):
+            return event.position().toPoint()
+        return event.pos()
+
+    def mousePressEvent(self, event):  # noqa: N802 - Qt naming
+        if event.button() == Qt.LeftButton:
+            local_pos = self.event_local_pos(event)
+            self._drag_start_pos = local_pos
+            self._drag_start_item = self.itemAt(local_pos)
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):  # noqa: N802 - Qt naming
+        if not (event.buttons() & Qt.LeftButton):
+            super().mouseMoveEvent(event)
+            return
+        if self._drag_start_pos is None or self._drag_start_item is None:
+            super().mouseMoveEvent(event)
+            return
+        drag_distance = QApplication.startDragDistance() if hasattr(QApplication, "startDragDistance") else QApplication.styleHints().startDragDistance()
+        if (self.event_local_pos(event) - self._drag_start_pos).manhattanLength() < drag_distance:
+            super().mouseMoveEvent(event)
+            return
+        self.setCurrentItem(self._drag_start_item)
+        self.startDrag(Qt.CopyAction)
+        self._drag_start_pos = None
+        self._drag_start_item = None
+
+    def startDrag(self, supported_actions):  # noqa: N802 - Qt naming
+        path = self.main_window.selected_material_path()
+        if not path or not path.exists():
+            return
+        mime = QMimeData()
+        file_url = QUrl.fromLocalFile(str(path.resolve()))
+        mime.setUrls([file_url])
+        mime.setText(str(path.resolve()))
+        mime.setData(INTERNAL_MATERIAL_DRAG_MIME, b"1")
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        thumb = self.main_window.selected_material_drag_pixmap()
+        if thumb is not None and not thumb.isNull():
+            drag.setPixmap(thumb)
+            drag.setHotSpot(QPoint(min(thumb.width() // 2, 32), min(thumb.height() // 2, 32)))
+        drag.exec(Qt.CopyAction)
 
     def dragEnterEvent(self, event):  # noqa: N802 - Qt naming
         if has_media_urls(event.mimeData()):
@@ -1809,6 +1859,13 @@ class MainWindow(QMainWindow):
         self.font_size_actions: dict[int, QAction] = {}
         self.image_viewers: list[ImageViewerWindow] = []
         self._viewer_open_offset = 0
+        self.material_load_chunk_size = 60
+        self._material_load_timer = QTimer(self)
+        self._material_load_timer.setInterval(0)
+        self._material_load_timer.timeout.connect(self.process_material_load_chunk)
+        self._material_load_rows: list[sqlite3.Row] = []
+        self._material_load_index = 0
+        self._material_load_prompt_id: Optional[int] = None
 
         self.setWindowTitle(APP_NAME)
         self.apply_window_icon()
@@ -2136,7 +2193,7 @@ class MainWindow(QMainWindow):
         backup_action = QAction("バックアップ実行", self)
         open_backup_action = QAction("バックアップフォルダを開く", self)
         quit_action = QAction("終了", self)
-        quit_action.setShortcut(QKeySequence.Quit)
+        quit_action.setShortcut(QKeySequence("Ctrl+Q"))
         open_assets_action.triggered.connect(self.open_assets_folder)
         backup_action.triggered.connect(self.run_manual_backup)
         open_backup_action.triggered.connect(self.open_backup_folder)
@@ -2491,6 +2548,7 @@ class MainWindow(QMainWindow):
         self.load_prompt(prompt_id)
 
     def clear_detail(self) -> None:
+        self.cancel_material_list_loading()
         self.loading = True
         self.current_prompt_id = None
         self.title_edit.clear()
@@ -3050,7 +3108,15 @@ class MainWindow(QMainWindow):
 
         return changed
 
+    def cancel_material_list_loading(self) -> None:
+        if self._material_load_timer.isActive():
+            self._material_load_timer.stop()
+        self._material_load_rows = []
+        self._material_load_index = 0
+        self._material_load_prompt_id = None
+
     def refresh_images(self, sync_assets: bool = True) -> None:
+        self.cancel_material_list_loading()
         self.image_list.clear()
         if self.current_prompt_id is None:
             return
@@ -3059,36 +3125,98 @@ class MainWindow(QMainWindow):
             if assets_changed:
                 self.refresh_prompt_list()
                 self.select_prompt_in_list(self.current_prompt_id)
-        for row in self.db.list_images(self.current_prompt_id):
-            image_id = int(row["id"])
-            file_path = str(row["file_path"])
-            thumb_path = str(row["thumbnail_path"] or file_path)
-            cover = bool(row["is_cover"])
-            media_type = str(row["media_type"] if "media_type" in row.keys() else "image")
-            file_name = Path(file_path).name
-            stem = Path(file_path).stem
-            prefix = media_label(media_type)
-            label_text = f"{prefix} {stem}" if prefix else stem
-            label = f"★ {label_text}" if cover else label_text
-            display_label = elide_material_label(label)
-            item = QListWidgetItem(display_label)
-            item.setData(Qt.UserRole, image_id)
-            item.setData(Qt.UserRole + 1, file_name)
-            item.setToolTip(file_name)
-            item.setTextAlignment(Qt.AlignHCenter | Qt.AlignTop)
-            item.setSizeHint(QSize(170, 150))
-            icon = icon_from_path(thumb_path, QSize(140, 105))
-            if icon.isNull():
-                icon = icon_from_path(file_path, QSize(140, 105))
-            if not icon.isNull():
-                item.setIcon(icon)
-            self.image_list.addItem(item)
+        rows = self.db.list_images(self.current_prompt_id)
+        self.start_material_list_loading(rows, self.current_prompt_id)
+
+    def start_material_list_loading(self, rows: list[sqlite3.Row], prompt_id: int) -> None:
+        self._material_load_rows = list(rows)
+        self._material_load_index = 0
+        self._material_load_prompt_id = prompt_id
+        total = len(self._material_load_rows)
+        if total == 0:
+            self.statusBar().showMessage("素材: 0 件")
+            return
+        self.statusBar().showMessage(f"素材一覧を読み込み中... 0/{total}")
+        self._material_load_timer.start()
+
+    def process_material_load_chunk(self) -> None:
+        prompt_id = self._material_load_prompt_id
+        if prompt_id is None or prompt_id != self.current_prompt_id:
+            self.cancel_material_list_loading()
+            return
+
+        total = len(self._material_load_rows)
+        if self._material_load_index >= total:
+            self._material_load_timer.stop()
+            self.statusBar().showMessage(f"素材: {total} 件")
+            return
+
+        end_index = min(total, self._material_load_index + self.material_load_chunk_size)
+        self.image_list.setUpdatesEnabled(False)
+        try:
+            for row in self._material_load_rows[self._material_load_index:end_index]:
+                self.add_material_list_item(row)
+        finally:
+            self.image_list.setUpdatesEnabled(True)
+        self._material_load_index = end_index
+
+        if self._material_load_index >= total:
+            self._material_load_timer.stop()
+            self.statusBar().showMessage(f"素材: {total} 件")
+        else:
+            self.statusBar().showMessage(f"素材一覧を読み込み中... {self._material_load_index}/{total}")
+
+    def add_material_list_item(self, row: sqlite3.Row) -> None:
+        image_id = int(row["id"])
+        file_path = str(row["file_path"])
+        thumb_path = str(row["thumbnail_path"] or file_path)
+        cover = bool(row["is_cover"])
+        media_type = str(row["media_type"] if "media_type" in row.keys() else "image")
+        file_name = Path(file_path).name
+        stem = Path(file_path).stem
+        prefix = media_label(media_type)
+        label_text = f"{prefix} {stem}" if prefix else stem
+        label = f"★ {label_text}" if cover else label_text
+        display_label = elide_material_label(label)
+        item = QListWidgetItem(display_label)
+        item.setData(Qt.UserRole, image_id)
+        item.setData(Qt.UserRole + 1, file_name)
+        item.setToolTip(file_name)
+        item.setTextAlignment(Qt.AlignHCenter | Qt.AlignTop)
+        item.setSizeHint(QSize(170, 150))
+        icon = icon_from_path(thumb_path, QSize(140, 105))
+        if icon.isNull():
+            icon = icon_from_path(file_path, QSize(140, 105))
+        if not icon.isNull():
+            item.setIcon(icon)
+        self.image_list.addItem(item)
 
     def selected_image_id(self) -> Optional[int]:
         item = self.image_list.currentItem()
         if not item:
             return None
         return int(item.data(Qt.UserRole))
+
+    def selected_material_path(self) -> Optional[Path]:
+        image_id = self.selected_image_id()
+        if image_id is None:
+            return None
+        row = self.db.get_image(image_id)
+        if not row:
+            return None
+        path = Path(str(row["file_path"] or ""))
+        return path if path.exists() else None
+
+    def selected_material_drag_pixmap(self) -> Optional[QPixmap]:
+        image_id = self.selected_image_id()
+        if image_id is None:
+            return None
+        row = self.db.get_image(image_id)
+        if not row:
+            return None
+        thumb_path = str(row["thumbnail_path"] or row["file_path"] or "")
+        pix = pixmap_from_path(thumb_path, QSize(96, 72))
+        return pix
 
     def on_material_selected(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
         if current is None:
@@ -3449,6 +3577,7 @@ class MainWindow(QMainWindow):
         if not self.maybe_save_dirty():
             event.ignore()
             return
+        self.cancel_material_list_loading()
         self.close_all_image_viewers()
         self.save_ui_state()
         self.db.close()
@@ -3825,6 +3954,8 @@ def has_media_urls(mime_data) -> bool:
 
 def media_paths_from_mime(mime_data) -> list[Path]:
     paths: list[Path] = []
+    if mime_data.hasFormat(INTERNAL_MATERIAL_DRAG_MIME):
+        return paths
     if not mime_data.hasUrls():
         return paths
     for url in mime_data.urls():
