@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-AI Prompt Organizer v15
+AI Prompt Organizer v17
 
 AI生成用プロンプトを、タイトル・タグ・説明・画像付きで管理するローカルGUIツール。
 PySide6 + SQLite で動作します。
@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 try:
-    from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal, QTimer
+    from PySide6.QtCore import QLockFile, QPoint, QRect, QSize, Qt, Signal, QTimer
     from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QIcon, QKeySequence, QPainter, QPixmap
     from PySide6.QtWidgets import (
         QApplication,
@@ -68,7 +68,7 @@ except Exception as exc:  # pragma: no cover - 実行環境向けメッセージ
 
 
 APP_NAME = "AI Prompt Organizer"
-APP_VERSION = "v1.3.0"
+APP_VERSION = "v1.4.0"
 APP_AUTHOR = "MF235"
 APP_CONTACT_X = "https://x.com/MF235XBR"
 APP_REPOSITORY = "https://github.com/mf235/ai-prompt-organizer"
@@ -76,6 +76,7 @@ APP_USER_MODEL_ID = "chappy.ai-prompt-organizer"
 WINDOW_ICON_RELATIVE = ("resources", "icons", "window.png")
 EXE_ICON_RELATIVE = ("resources", "icons", "app.ico")
 DB_FILENAME = "prompt_organizer.db"
+BACKUP_DIR_NAME = "_backup"
 SUPPORTED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
 SUPPORTED_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 SUPPORTED_MEDIA_EXTS = SUPPORTED_IMAGE_EXTS | SUPPORTED_VIDEO_EXTS
@@ -189,6 +190,7 @@ class Database:
             )
             """
         )
+        self.ensure_column("tags", "visible", "INTEGER NOT NULL DEFAULT 1")
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS prompt_tags (
@@ -291,6 +293,15 @@ class Database:
     def close(self) -> None:
         self.conn.close()
 
+    def backup_to(self, dest_path: Path) -> None:
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn.commit()
+        backup_conn = sqlite3.connect(str(dest_path))
+        try:
+            self.conn.backup(backup_conn)
+        finally:
+            backup_conn.close()
+
     def now(self) -> str:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -350,24 +361,25 @@ class Database:
         cur.execute("INSERT INTO tags(name, category, color) VALUES(?, ?, ?)", (name, category, color))
         return int(cur.lastrowid)
 
-    def update_tag(self, tag_id: Optional[int], name: str, category: str, color: str = "") -> int:
+    def update_tag(self, tag_id: Optional[int], name: str, category: str, color: str = "", visible: bool = True) -> int:
         name = normalize_tag(name)
         if not name:
             raise ValueError("タグ名が空です。")
         category = normalize_category(category) or "custom"
         color = normalize_hex_color(color)
+        visible_value = 1 if visible else 0
         self.ensure_category(category)
         cur = self.conn.cursor()
         if tag_id is None:
             row = cur.execute("SELECT id FROM tags WHERE name = ?", (name,)).fetchone()
             if row:
                 tag_id = int(row["id"])
-                cur.execute("UPDATE tags SET category = ?, color = ? WHERE id = ?", (category, color, tag_id))
+                cur.execute("UPDATE tags SET category = ?, color = ?, visible = ? WHERE id = ?", (category, color, visible_value, tag_id))
             else:
-                cur.execute("INSERT INTO tags(name, category, color) VALUES(?, ?, ?)", (name, category, color))
+                cur.execute("INSERT INTO tags(name, category, color, visible) VALUES(?, ?, ?, ?)", (name, category, color, visible_value))
                 tag_id = int(cur.lastrowid)
         else:
-            cur.execute("UPDATE tags SET name = ?, category = ?, color = ? WHERE id = ?", (name, category, color, tag_id))
+            cur.execute("UPDATE tags SET name = ?, category = ?, color = ?, visible = ? WHERE id = ?", (name, category, color, visible_value, tag_id))
         self.conn.commit()
         return int(tag_id)
 
@@ -497,7 +509,7 @@ class Database:
     def list_tags_with_counts(self) -> list[sqlite3.Row]:
         return self.conn.execute(
             """
-            SELECT t.id, t.name, t.category, t.color, COALESCE(c.color, '#777777') AS category_color,
+            SELECT t.id, t.name, t.category, t.color, t.visible, COALESCE(c.color, '#777777') AS category_color,
                    COUNT(pt.prompt_id) AS count
             FROM tags t
             LEFT JOIN prompt_tags pt ON pt.tag_id = t.id
@@ -957,9 +969,11 @@ class ImageListWidget(QListWidget):
         self.setDragDropMode(QAbstractItemView.DropOnly)
         self.setViewMode(QListWidget.IconMode)
         self.setIconSize(QSize(140, 105))
+        self.setGridSize(QSize(170, 150))
         self.setResizeMode(QListWidget.Adjust)
         self.setMovement(QListWidget.Static)
         self.setSpacing(8)
+        self.setWordWrap(False)
         self.setSelectionMode(QAbstractItemView.SingleSelection)
         self.setMinimumHeight(170)
 
@@ -1082,6 +1096,8 @@ class TagManagerDialog(QDialog):
         self.tag_color_edit = QLineEdit()
         self.tag_color_edit.setPlaceholderText("空ならカテゴリ色")
         self.tag_color_button = QPushButton("タグ色")
+        self.tag_visible_check = QCheckBox("表示する")
+        self.tag_visible_check.setChecked(True)
         self.category_color_edit = QLineEdit()
         self.category_color_button = QPushButton("カテゴリ色")
         self.new_tag_button = QPushButton("新規")
@@ -1098,13 +1114,14 @@ class TagManagerDialog(QDialog):
         tag_form.addWidget(QLabel("カテゴリ色"), 3, 0)
         tag_form.addWidget(self.category_color_edit, 3, 1)
         tag_form.addWidget(self.category_color_button, 3, 2)
+        tag_form.addWidget(self.tag_visible_check, 4, 1, 1, 3)
         tag_btn_row = QHBoxLayout()
         tag_btn_row.addWidget(self.new_tag_button)
         tag_btn_row.addWidget(self.save_tag_button)
         tag_btn_row.addWidget(self.delete_tag_button)
         tag_btn_row.addStretch(1)
-        tag_form.addLayout(tag_btn_row, 4, 0, 1, 4)
-        tag_form.setRowStretch(5, 1)
+        tag_form.addLayout(tag_btn_row, 5, 0, 1, 4)
+        tag_form.setRowStretch(6, 1)
         tag_root.addWidget(tag_form_box, 2)
         tabs.addTab(tag_tab, "タグ")
 
@@ -1207,7 +1224,9 @@ class TagManagerDialog(QDialog):
             name = str(row["name"])
             category = str(row["category"])
             count = int(row["count"])
-            label = f"{name}   [{category}]   ({count})"
+            visible = int(row["visible"] if "visible" in row.keys() else 1)
+            hidden = "" if visible else "   [非表示]"
+            label = f"{name}   [{category}]   ({count}){hidden}"
             item = QListWidgetItem(label)
             item.setData(Qt.UserRole, int(row["id"]))
             item.setIcon(colored_square_icon(effective_color_from_row(row), QSize(16, 16)))
@@ -1245,6 +1264,7 @@ class TagManagerDialog(QDialog):
         else:
             self.tag_category_combo.setEditText(category)
         self.tag_color_edit.setText(str(row["color"] or ""))
+        self.tag_visible_check.setChecked(int(row["visible"] if "visible" in row.keys() else 1) != 0)
         self.category_color_edit.setText(self.db.get_category_color(category))
 
     def on_category_text_changed(self, text: str) -> None:
@@ -1257,6 +1277,7 @@ class TagManagerDialog(QDialog):
         self.tag_name_edit.clear()
         self.tag_category_combo.setEditText("custom")
         self.tag_color_edit.clear()
+        self.tag_visible_check.setChecked(True)
         self.category_color_edit.setText(self.db.get_category_color("custom"))
         self.tag_name_edit.setFocus()
 
@@ -1269,6 +1290,7 @@ class TagManagerDialog(QDialog):
                 self.tag_name_edit.text(),
                 category,
                 self.tag_color_edit.text(),
+                self.tag_visible_check.isChecked(),
             )
             self.refresh_categories()
             self.refresh_tag_list()
@@ -1429,8 +1451,10 @@ class MainWindow(QMainWindow):
         self.legacy_files_dir = self.assets_dir / "files"
         self.legacy_thumbs_dir = self.assets_dir / "thumbnails"
         self.assets_dir.mkdir(parents=True, exist_ok=True)
+        self.backup_dir = self.base_dir / BACKUP_DIR_NAME
 
         self.db = Database(self.db_path)
+        self.run_daily_backup_if_needed()
         self.migrate_legacy_asset_layout()
         self.current_prompt_id: Optional[int] = None
         self.loading = False
@@ -1464,6 +1488,36 @@ class MainWindow(QMainWindow):
         if app is not None:
             app.setWindowIcon(icon)
         self.setWindowIcon(icon)
+
+    def backup_database(self, manual: bool = False) -> Optional[Path]:
+        if not self.db_path.exists():
+            return None
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        dest = unique_path(self.backup_dir / f"{timestamp}.db")
+        self.db.backup_to(dest)
+        return dest
+
+    def run_daily_backup_if_needed(self) -> None:
+        today = datetime.now().strftime("%Y%m%d")
+        if self.db.get_setting("last_auto_backup_date", "") == today:
+            return
+        try:
+            self.backup_database(manual=False)
+            self.db.set_setting("last_auto_backup_date", today)
+        except Exception:
+            pass
+
+    def run_manual_backup(self) -> None:
+        try:
+            if self.dirty:
+                self.save_current_prompt()
+            backup_path = self.backup_database(manual=True)
+            if backup_path:
+                QMessageBox.information(self, "バックアップ完了", f"DBをバックアップしました。\n{backup_path}")
+            else:
+                QMessageBox.warning(self, "バックアップ失敗", "バックアップ対象のDBが見つかりませんでした。")
+        except Exception as exc:
+            QMessageBox.warning(self, "バックアップ失敗", f"DBをバックアップできませんでした。\n\n{exc}")
 
     def prompt_asset_dir(self, prompt_id: int) -> Path:
         return self.assets_dir / f"prompt_{prompt_id:06d}"
@@ -1665,7 +1719,9 @@ class MainWindow(QMainWindow):
         meta_layout.addWidget(QLabel("タイトル"), 0, 0)
         meta_layout.addWidget(self.title_edit, 0, 1, 1, 4)
         meta_layout.addWidget(self.favorite_check, 0, 5)
-        meta_layout.addWidget(QLabel("評価"), 0, 6)
+        rating_label = QLabel("評価")
+        rating_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        meta_layout.addWidget(rating_label, 0, 6)
         meta_layout.addWidget(self.rating_combo, 0, 7)
         meta_layout.addWidget(QLabel("使用AI"), 1, 0)
         meta_layout.addWidget(self.engine_edit, 1, 1)
@@ -1761,13 +1817,16 @@ class MainWindow(QMainWindow):
         new_action.setShortcut(QKeySequence.New)
         save_action = QAction("保存", self)
         save_action.setShortcut(QKeySequence.Save)
+        backup_action = QAction("バックアップ実行", self)
         quit_action = QAction("終了", self)
         quit_action.setShortcut(QKeySequence.Quit)
         new_action.triggered.connect(self.new_prompt)
         save_action.triggered.connect(self.save_current_prompt)
+        backup_action.triggered.connect(self.run_manual_backup)
         quit_action.triggered.connect(self.close)
         file_menu.addAction(new_action)
         file_menu.addAction(save_action)
+        file_menu.addAction(backup_action)
         file_menu.addSeparator()
         file_menu.addAction(quit_action)
 
@@ -1821,6 +1880,7 @@ class MainWindow(QMainWindow):
         self.open_image_button.clicked.connect(self.open_selected_image)
         self.open_prompt_assets_button.clicked.connect(self.open_current_prompt_asset_folder)
         self.image_list.itemDoubleClicked.connect(lambda _item: self.open_selected_image())
+        self.image_list.currentItemChanged.connect(self.on_material_selected)
 
         self.title_edit.textChanged.connect(self.mark_dirty)
         for combo in [
@@ -1960,6 +2020,8 @@ class MainWindow(QMainWindow):
             count = int(row["count"])
             color = effective_color_from_row(row)
             self.tag_color_map[name] = color
+            if int(row["visible"] if "visible" in row.keys() else 1) == 0:
+                continue
             btn = QToolButton()
             btn.setText(f"{name} ({count})")
             btn.setCheckable(True)
@@ -2271,6 +2333,8 @@ class MainWindow(QMainWindow):
         assert self.current_prompt_id is not None
         added = 0
         prompt_image_dir, prompt_file_dir, _prompt_thumb_dir = self.ensure_prompt_asset_dirs(self.current_prompt_id)
+        video_count = sum(1 for p in paths if p.suffix.lower() in SUPPORTED_VIDEO_EXTS)
+        video_mode_for_all: Optional[str] = None
 
         for src in paths:
             try:
@@ -2286,7 +2350,12 @@ class MainWindow(QMainWindow):
                     added += 1
 
                 elif ext in SUPPORTED_VIDEO_EXTS:
-                    mode = self.ask_video_import_mode(src)
+                    if video_mode_for_all is not None:
+                        mode = video_mode_for_all
+                    else:
+                        mode, apply_all = self.ask_video_import_mode(src, allow_apply_all=video_count > 1)
+                        if apply_all and mode is not None:
+                            video_mode_for_all = mode
                     if mode is None:
                         continue
                     if mode == "copy":
@@ -2323,22 +2392,27 @@ class MainWindow(QMainWindow):
             self.refresh_prompt_list()
             self.statusBar().showMessage(f"素材を {added} 件追加しました")
 
-    def ask_video_import_mode(self, src: Path) -> Optional[str]:
+    def ask_video_import_mode(self, src: Path, allow_apply_all: bool = False) -> tuple[Optional[str], bool]:
         box = QMessageBox(self)
         box.setWindowTitle("動画追加")
         box.setText(f"動画をどう追加しますか？\n{src.name}")
         thumb_button = box.addButton("サムネ画像のみ作成", QMessageBox.AcceptRole)
         copy_button = box.addButton("動画をコピーして登録", QMessageBox.ActionRole)
         cancel_button = box.addButton("キャンセル", QMessageBox.RejectRole)
+        apply_checkbox: Optional[QCheckBox] = None
+        if allow_apply_all:
+            apply_checkbox = QCheckBox("今後すべてに適用")
+            box.setCheckBox(apply_checkbox)
         box.setDefaultButton(thumb_button)
         box.setEscapeButton(cancel_button)
         box.exec()
+        apply_all = bool(apply_checkbox and apply_checkbox.isChecked())
         clicked = box.clickedButton()
         if clicked == thumb_button:
-            return "thumb"
+            return "thumb", apply_all
         if clicked == copy_button:
-            return "copy"
-        return None
+            return "copy", apply_all
+        return None, False
 
     def create_thumbnail(self, src: Path, image_id: int, prompt_id: int) -> Optional[Path]:
         pix = QPixmap(str(src))
@@ -2453,13 +2527,18 @@ class MainWindow(QMainWindow):
             thumb_path = str(row["thumbnail_path"] or file_path)
             cover = bool(row["is_cover"])
             media_type = str(row["media_type"] if "media_type" in row.keys() else "image")
+            file_name = Path(file_path).name
             stem = Path(file_path).stem
             prefix = media_label(media_type)
             label_text = f"{prefix} {stem}" if prefix else stem
             label = f"★ {label_text}" if cover else label_text
-            item = QListWidgetItem(label)
+            display_label = elide_material_label(label)
+            item = QListWidgetItem(display_label)
             item.setData(Qt.UserRole, image_id)
-            item.setToolTip(file_path)
+            item.setData(Qt.UserRole + 1, file_name)
+            item.setToolTip(file_name)
+            item.setTextAlignment(Qt.AlignHCenter | Qt.AlignTop)
+            item.setSizeHint(QSize(170, 150))
             icon = icon_from_path(thumb_path, QSize(140, 105))
             if icon.isNull():
                 icon = icon_from_path(file_path, QSize(140, 105))
@@ -2472,6 +2551,13 @@ class MainWindow(QMainWindow):
         if not item:
             return None
         return int(item.data(Qt.UserRole))
+
+    def on_material_selected(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
+        if current is None:
+            self.drop_hint_label.setText("画像/動画/ファイルをここへドラッグ＆ドロップで追加できます。")
+            return
+        file_name = str(current.data(Qt.UserRole + 1) or current.text())
+        self.drop_hint_label.setText(file_name)
 
     def rename_selected_image(self) -> None:
         image_id = self.selected_image_id()
@@ -3019,6 +3105,14 @@ def media_paths_from_mime(mime_data) -> list[Path]:
     return paths
 
 
+def elide_material_label(text: str, max_chars: int = 22) -> str:
+    text = str(text or "")
+    if len(text) <= max_chars:
+        return text
+    keep = max(1, max_chars - 1)
+    return text[:keep] + "…"
+
+
 def open_path(path: Path) -> None:
     path = path.resolve()
     try:
@@ -3046,11 +3140,20 @@ def main() -> int:
     app_icon = load_window_icon()
     if not app_icon.isNull():
         app.setWindowIcon(app_icon)
+
+    lock = QLockFile(str(get_base_dir() / ".ai-prompt-organizer.lock"))
+    lock.setStaleLockTime(0)
+    if not lock.tryLock(100):
+        QMessageBox.information(None, APP_NAME, "AI Prompt Organizer は既に起動しています。")
+        return 0
+
     window = MainWindow()
     window.show()
     QTimer.singleShot(0, window.apply_window_icon)
     QTimer.singleShot(1000, window.apply_window_icon)
-    return app.exec()
+    result = app.exec()
+    lock.unlock()
+    return result
 
 
 if __name__ == "__main__":
