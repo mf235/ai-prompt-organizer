@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-AI Prompt Organizer v13
+AI Prompt Organizer v15
 
 AI生成用プロンプトを、タイトル・タグ・説明・画像付きで管理するローカルGUIツール。
 PySide6 + SQLite で動作します。
@@ -28,7 +28,7 @@ from typing import Callable, Iterable, Optional
 
 try:
     from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal, QTimer
-    from PySide6.QtGui import QAction, QColor, QGuiApplication, QIcon, QKeySequence, QPixmap
+    from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QIcon, QKeySequence, QPainter, QPixmap
     from PySide6.QtWidgets import (
         QApplication,
         QAbstractItemView,
@@ -68,6 +68,10 @@ except Exception as exc:  # pragma: no cover - 実行環境向けメッセージ
 
 
 APP_NAME = "AI Prompt Organizer"
+APP_VERSION = "v1.3.0"
+APP_AUTHOR = "MF235"
+APP_CONTACT_X = "https://x.com/MF235XBR"
+APP_REPOSITORY = "https://github.com/mf235/ai-prompt-organizer"
 APP_USER_MODEL_ID = "chappy.ai-prompt-organizer"
 WINDOW_ICON_RELATIVE = ("resources", "icons", "window.png")
 EXE_ICON_RELATIVE = ("resources", "icons", "app.ico")
@@ -75,6 +79,11 @@ DB_FILENAME = "prompt_organizer.db"
 SUPPORTED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
 SUPPORTED_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 SUPPORTED_MEDIA_EXTS = SUPPORTED_IMAGE_EXTS | SUPPORTED_VIDEO_EXTS
+ARCHIVE_EXTS = {".zip", ".7z", ".rar", ".tar", ".gz"}
+AUDIO_EXTS = {".wav", ".mp3", ".ogg", ".flac", ".m4a"}
+TEXT_EXTS = {".txt", ".md", ".json", ".csv", ".yaml", ".yml", ".xml", ".html", ".css", ".js", ".py"}
+DOCUMENT_EXTS = {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx"}
+CODE_EXTS = {".py", ".js", ".ts", ".html", ".css", ".cpp", ".c", ".h", ".cs", ".java", ".rs", ".go"}
 
 
 DEFAULT_CATEGORY_COLORS = {
@@ -206,6 +215,8 @@ class Database:
             )
             """
         )
+        self.ensure_column("images", "media_type", "TEXT NOT NULL DEFAULT 'image'")
+        self.ensure_column("images", "original_name", "TEXT NOT NULL DEFAULT ''")
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS tag_presets (
@@ -260,6 +271,11 @@ class Database:
 
         self.seed_defaults()
         self.set_setting("defaults_seeded_v1", "1")
+
+    def ensure_column(self, table: str, column: str, definition: str) -> None:
+        existing = {str(row["name"]) for row in self.conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column not in existing:
+            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def seed_defaults(self) -> None:
         for category, color in DEFAULT_CATEGORY_COLORS.items():
@@ -534,7 +550,16 @@ class Database:
             )
         return result
 
-    def add_image(self, prompt_id: int, file_path: str, thumbnail_path: str = "", caption: str = "", is_cover: int = 0) -> int:
+    def add_image(
+        self,
+        prompt_id: int,
+        file_path: str,
+        thumbnail_path: str = "",
+        caption: str = "",
+        is_cover: int = 0,
+        media_type: str = "image",
+        original_name: str = "",
+    ) -> int:
         cur = self.conn.cursor()
         max_sort = cur.execute("SELECT COALESCE(MAX(sort_order), -1) AS max_sort FROM images WHERE prompt_id = ?", (prompt_id,)).fetchone()["max_sort"]
         count = cur.execute("SELECT COUNT(*) AS c FROM images WHERE prompt_id = ?", (prompt_id,)).fetchone()["c"]
@@ -542,10 +567,10 @@ class Database:
             is_cover = 1
         cur.execute(
             """
-            INSERT INTO images(prompt_id, file_path, thumbnail_path, sort_order, caption, is_cover, created_at)
-            VALUES(?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO images(prompt_id, file_path, thumbnail_path, sort_order, caption, is_cover, created_at, media_type, original_name)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (prompt_id, file_path, thumbnail_path, int(max_sort) + 1, caption, is_cover, self.now()),
+            (prompt_id, file_path, thumbnail_path, int(max_sort) + 1, caption, is_cover, self.now(), media_type, original_name),
         )
         self.conn.commit()
         return int(cur.lastrowid)
@@ -1400,12 +1425,13 @@ class MainWindow(QMainWindow):
         self.base_dir = get_base_dir()
         self.db_path = self.base_dir / DB_FILENAME
         self.assets_dir = self.base_dir / "assets"
-        self.images_dir = self.assets_dir / "images"
-        self.thumbs_dir = self.assets_dir / "thumbnails"
-        self.images_dir.mkdir(parents=True, exist_ok=True)
-        self.thumbs_dir.mkdir(parents=True, exist_ok=True)
+        self.legacy_images_dir = self.assets_dir / "images"
+        self.legacy_files_dir = self.assets_dir / "files"
+        self.legacy_thumbs_dir = self.assets_dir / "thumbnails"
+        self.assets_dir.mkdir(parents=True, exist_ok=True)
 
         self.db = Database(self.db_path)
+        self.migrate_legacy_asset_layout()
         self.current_prompt_id: Optional[int] = None
         self.loading = False
         self.tag_list_loading = False
@@ -1438,6 +1464,82 @@ class MainWindow(QMainWindow):
         if app is not None:
             app.setWindowIcon(icon)
         self.setWindowIcon(icon)
+
+    def prompt_asset_dir(self, prompt_id: int) -> Path:
+        return self.assets_dir / f"prompt_{prompt_id:06d}"
+
+    def prompt_images_dir(self, prompt_id: int) -> Path:
+        return self.prompt_asset_dir(prompt_id) / "images"
+
+    def prompt_files_dir(self, prompt_id: int) -> Path:
+        return self.prompt_asset_dir(prompt_id) / "files"
+
+    def prompt_thumbs_dir(self, prompt_id: int) -> Path:
+        return self.prompt_asset_dir(prompt_id) / "thumbnails"
+
+    def ensure_prompt_asset_dirs(self, prompt_id: int) -> tuple[Path, Path, Path]:
+        image_dir = self.prompt_images_dir(prompt_id)
+        file_dir = self.prompt_files_dir(prompt_id)
+        thumb_dir = self.prompt_thumbs_dir(prompt_id)
+        image_dir.mkdir(parents=True, exist_ok=True)
+        file_dir.mkdir(parents=True, exist_ok=True)
+        thumb_dir.mkdir(parents=True, exist_ok=True)
+        return image_dir, file_dir, thumb_dir
+
+    def migrate_legacy_asset_layout(self) -> None:
+        legacy_roots = [self.legacy_images_dir, self.legacy_files_dir, self.legacy_thumbs_dir]
+        if not any(path.exists() for path in legacy_roots):
+            return
+
+        rows = self.db.conn.execute("SELECT * FROM images ORDER BY id ASC").fetchall()
+        for row in rows:
+            image_id = int(row["id"])
+            prompt_id = int(row["prompt_id"])
+            media_type = str(row["media_type"] if "media_type" in row.keys() else "image")
+            image_dir, file_dir, thumb_dir = self.ensure_prompt_asset_dirs(prompt_id)
+
+            file_path = Path(str(row["file_path"] or ""))
+            if file_path.exists():
+                target_dir = image_dir if media_type == "image" else file_dir
+                if not is_relative_to_path(file_path, target_dir):
+                    try:
+                        dest = unique_path(target_dir / file_path.name)
+                        shutil.move(str(file_path), str(dest))
+                        self.db.update_image_file_path(image_id, str(dest))
+                    except Exception:
+                        pass
+
+            thumb_path = Path(str(row["thumbnail_path"] or ""))
+            if thumb_path.exists() and not is_relative_to_path(thumb_path, thumb_dir):
+                try:
+                    dest = unique_path(thumb_dir / thumb_path.name)
+                    shutil.move(str(thumb_path), str(dest))
+                    self.db.update_image_thumbnail(image_id, str(dest))
+                except Exception:
+                    pass
+
+        self.migrate_remaining_legacy_prompt_folders(self.legacy_images_dir, "images")
+        self.migrate_remaining_legacy_prompt_folders(self.legacy_files_dir, "files")
+        for root in legacy_roots:
+            remove_empty_dirs(root)
+
+    def migrate_remaining_legacy_prompt_folders(self, legacy_root: Path, subfolder: str) -> None:
+        if not legacy_root.exists():
+            return
+        for prompt_dir in legacy_root.glob("prompt_*"):
+            if not prompt_dir.is_dir():
+                continue
+            match = re.fullmatch(r"prompt_(\d+)", prompt_dir.name)
+            if not match:
+                continue
+            prompt_id = int(match.group(1))
+            target_dir = self.prompt_asset_dir(prompt_id) / subfolder
+            target_dir.mkdir(parents=True, exist_ok=True)
+            for child in list(prompt_dir.iterdir()):
+                try:
+                    shutil.move(str(child), str(unique_path(target_dir / child.name)))
+                except Exception:
+                    pass
 
     def create_editable_combo(self, placeholder: str) -> QComboBox:
         combo = QComboBox()
@@ -1526,7 +1628,6 @@ class MainWindow(QMainWindow):
         self.save_button = QPushButton("保存")
         self.copy_prompt_button = QPushButton("プロンプトをコピー")
         self.copy_full_button = QPushButton("タイトル+プロンプトをコピー")
-        self.open_assets_button = QPushButton("画像フォルダ")
         self.manage_tags_button = QPushButton("タグ管理")
         self.font_size_spin = QSpinBox()
         self.font_size_spin.setRange(8, 28)
@@ -1539,7 +1640,6 @@ class MainWindow(QMainWindow):
         top_row.addStretch(1)
         top_row.addWidget(QLabel("文字サイズ"))
         top_row.addWidget(self.font_size_spin)
-        top_row.addWidget(self.open_assets_button)
         right_layout.addLayout(top_row)
 
         scroll = QScrollArea()
@@ -1621,25 +1721,27 @@ class MainWindow(QMainWindow):
         desc_layout.addWidget(self.description_edit)
         form_root.addWidget(desc_group)
 
-        image_group = CollapsibleGroupBox("画像", "section_images_collapsed")
+        image_group = CollapsibleGroupBox("素材", "section_images_collapsed")
         self.collapsible_sections.append(image_group)
         image_layout = QVBoxLayout(image_group)
         img_btn_row = QHBoxLayout()
-        self.add_images_button = QPushButton("画像/動画を追加")
+        self.add_images_button = QPushButton("素材を追加")
         self.rename_image_button = QPushButton("ファイル名変更")
-        self.remove_image_button = QPushButton("選択画像を削除")
+        self.remove_image_button = QPushButton("選択素材を削除")
         self.cover_image_button = QPushButton("カバーにする")
-        self.open_image_button = QPushButton("画像を開く")
+        self.open_image_button = QPushButton("開く")
+        self.open_prompt_assets_button = QPushButton("素材フォルダ")
         img_btn_row.addWidget(self.add_images_button)
         img_btn_row.addWidget(self.rename_image_button)
         img_btn_row.addWidget(self.remove_image_button)
         img_btn_row.addWidget(self.cover_image_button)
         img_btn_row.addWidget(self.open_image_button)
+        img_btn_row.addWidget(self.open_prompt_assets_button)
         img_btn_row.addStretch(1)
         image_layout.addLayout(img_btn_row)
         self.image_list = ImageListWidget(self)
         image_layout.addWidget(self.image_list)
-        self.drop_hint_label = QLabel("画像/動画ファイルをここへドラッグ＆ドロップで追加できます。")
+        self.drop_hint_label = QLabel("画像/動画/ファイルをここへドラッグ＆ドロップで追加できます。")
         self.drop_hint_label.setStyleSheet("color: #777;")
         image_layout.addWidget(self.drop_hint_label)
         form_root.addWidget(image_group)
@@ -1683,6 +1785,16 @@ class MainWindow(QMainWindow):
         edit_menu.addSeparator()
         edit_menu.addAction(tag_manage_action)
 
+        view_menu = self.menuBar().addMenu("表示")
+        open_assets_action = QAction("素材フォルダを開く", self)
+        open_assets_action.triggered.connect(self.open_assets_folder)
+        view_menu.addAction(open_assets_action)
+
+        help_menu = self.menuBar().addMenu("ヘルプ")
+        about_action = QAction("バージョン情報", self)
+        about_action.triggered.connect(self.show_about_dialog)
+        help_menu.addAction(about_action)
+
     def connect_signals(self) -> None:
         self.search_edit.textChanged.connect(self.refresh_prompt_list)
         self.prompt_list.currentItemChanged.connect(self.on_prompt_selected)
@@ -1699,7 +1811,6 @@ class MainWindow(QMainWindow):
         self.delete_button.clicked.connect(self.delete_current_prompt)
         self.copy_prompt_button.clicked.connect(self.copy_prompt)
         self.copy_full_button.clicked.connect(self.copy_full_prompt)
-        self.open_assets_button.clicked.connect(self.open_current_image_folder)
         self.manage_tags_button.clicked.connect(self.open_tag_manager)
         self.add_preset_button.clicked.connect(self.add_selected_preset)
 
@@ -1708,6 +1819,7 @@ class MainWindow(QMainWindow):
         self.remove_image_button.clicked.connect(self.remove_selected_image)
         self.cover_image_button.clicked.connect(self.set_selected_image_as_cover)
         self.open_image_button.clicked.connect(self.open_selected_image)
+        self.open_prompt_assets_button.clicked.connect(self.open_current_prompt_asset_folder)
         self.image_list.itemDoubleClicked.connect(lambda _item: self.open_selected_image())
 
         self.title_edit.textChanged.connect(self.mark_dirty)
@@ -2054,7 +2166,7 @@ class MainWindow(QMainWindow):
         self.refresh_prompt_list()
         self.select_prompt_in_list(new_id)
         self.load_prompt(new_id)
-        self.statusBar().showMessage("複製しました。画像はコピーせず、プロンプト情報だけ複製しています。")
+        self.statusBar().showMessage("複製しました。素材はコピーせず、プロンプト情報だけ複製しています。")
 
     def delete_current_prompt(self) -> None:
         if self.current_prompt_id is None:
@@ -2063,7 +2175,7 @@ class MainWindow(QMainWindow):
         result = QMessageBox.question(
             self,
             "削除確認",
-            f"「{title}」を削除しますか？\nDB上の登録を削除し、assets内の画像ファイルはWindowsのゴミ箱へ移動します。",
+            f"「{title}」を削除しますか？\nDB上の登録を削除し、assets内の素材ファイルはWindowsのゴミ箱へ移動します。",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -2072,7 +2184,7 @@ class MainWindow(QMainWindow):
 
         deleted_id = self.current_prompt_id
         image_rows = self.db.list_images(deleted_id)
-        prompt_asset_dir = self.images_dir / f"prompt_{deleted_id:06d}"
+        prompt_asset_dir = self.prompt_asset_dir(deleted_id)
         recycle_targets: list[Path] = []
         if prompt_asset_dir.exists():
             recycle_targets.append(prompt_asset_dir)
@@ -2081,7 +2193,7 @@ class MainWindow(QMainWindow):
             thumb_path = Path(str(row["thumbnail_path"] or ""))
             if file_path.exists() and not (prompt_asset_dir.exists() and is_relative_to_path(file_path, prompt_asset_dir)):
                 recycle_targets.append(file_path)
-            if thumb_path.exists():
+            if thumb_path.exists() and not (prompt_asset_dir.exists() and is_relative_to_path(thumb_path, prompt_asset_dir)):
                 recycle_targets.append(thumb_path)
 
         self.db.delete_prompt(deleted_id)
@@ -2093,7 +2205,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "削除警告", "登録は削除しましたが、一部ファイルをゴミ箱へ移動できませんでした。\n\n" + "\n".join(errors[:5]))
             self.statusBar().showMessage(f"削除しました。一部ファイル移動失敗: {len(errors)} 件")
         else:
-            self.statusBar().showMessage(f"削除しました。画像ファイルをゴミ箱へ移動: {moved} 件")
+            self.statusBar().showMessage(f"削除しました。素材ファイルをゴミ箱へ移動: {moved} 件")
 
     def copy_prompt(self) -> None:
         text = strip_prompt_comment_lines(self.prompt_edit.toPlainText())
@@ -2143,57 +2255,119 @@ class MainWindow(QMainWindow):
     def choose_images(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(
             self,
-            "画像/動画を選択",
+            "素材を選択",
             str(Path.home()),
-            "Media (*.png *.jpg *.jpeg *.webp *.bmp *.gif *.mp4 *.mov *.avi *.mkv *.webm);;Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif);;Videos (*.mp4 *.mov *.avi *.mkv *.webm);;All Files (*.*)",
+            "All Files (*.*);;Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif);;Videos (*.mp4 *.mov *.avi *.mkv *.webm)",
         )
         if files:
             self.add_images_from_paths([Path(f) for f in files])
 
     def add_images_from_paths(self, paths: Iterable[Path]) -> None:
-        paths = [Path(p) for p in paths if Path(p).suffix.lower() in SUPPORTED_MEDIA_EXTS and Path(p).exists()]
+        paths = [Path(p) for p in paths if Path(p).exists() and Path(p).is_file()]
         if not paths:
             return
         if not self.ensure_current_prompt_saved_for_images():
             return
         assert self.current_prompt_id is not None
         added = 0
-        prompt_asset_dir = self.images_dir / f"prompt_{self.current_prompt_id:06d}"
-        prompt_asset_dir.mkdir(parents=True, exist_ok=True)
+        prompt_image_dir, prompt_file_dir, _prompt_thumb_dir = self.ensure_prompt_asset_dirs(self.current_prompt_id)
+
         for src in paths:
             try:
                 ext = src.suffix.lower()
                 if ext in SUPPORTED_IMAGE_EXTS:
-                    dest = unique_path(prompt_asset_dir / safe_filename(src.name))
+                    dest = unique_path(prompt_image_dir / safe_filename(src.name))
                     if src.resolve() != dest.resolve():
                         shutil.copy2(src, dest)
+                    image_id = self.db.add_image(self.current_prompt_id, str(dest), "", media_type="image", original_name=src.name)
+                    thumb_path = self.create_thumbnail(dest, image_id, self.current_prompt_id)
+                    if thumb_path:
+                        self.db.update_image_thumbnail(image_id, str(thumb_path))
+                    added += 1
+
                 elif ext in SUPPORTED_VIDEO_EXTS:
-                    dest = self.generate_video_snapshot(src, prompt_asset_dir)
+                    mode = self.ask_video_import_mode(src)
+                    if mode is None:
+                        continue
+                    if mode == "copy":
+                        dest = unique_path(prompt_file_dir / safe_filename(src.name))
+                        if src.resolve() != dest.resolve():
+                            shutil.copy2(src, dest)
+                        image_id = self.db.add_image(self.current_prompt_id, str(dest), "", media_type="video", original_name=src.name)
+                        thumb_path = self.create_video_thumbnail(src, image_id, self.current_prompt_id)
+                        if not thumb_path:
+                            thumb_path = self.create_extension_thumbnail(dest, image_id, self.current_prompt_id)
+                        if thumb_path:
+                            self.db.update_image_thumbnail(image_id, str(thumb_path))
+                    else:
+                        dest = self.generate_video_snapshot(src, prompt_image_dir)
+                        image_id = self.db.add_image(self.current_prompt_id, str(dest), "", media_type="image", original_name=src.name)
+                        thumb_path = self.create_thumbnail(dest, image_id, self.current_prompt_id)
+                        if thumb_path:
+                            self.db.update_image_thumbnail(image_id, str(thumb_path))
+                    added += 1
+
                 else:
-                    continue
-                image_id = self.db.add_image(self.current_prompt_id, str(dest), "")
-                thumb_path = self.create_thumbnail(dest, image_id)
-                if thumb_path:
-                    self.db.update_image_thumbnail(image_id, str(thumb_path))
-                added += 1
+                    dest = unique_path(prompt_file_dir / safe_filename(src.name))
+                    if src.resolve() != dest.resolve():
+                        shutil.copy2(src, dest)
+                    image_id = self.db.add_image(self.current_prompt_id, str(dest), "", media_type=media_type_for_path(src), original_name=src.name)
+                    thumb_path = self.create_extension_thumbnail(src, image_id, self.current_prompt_id)
+                    if thumb_path:
+                        self.db.update_image_thumbnail(image_id, str(thumb_path))
+                    added += 1
             except Exception as exc:
-                QMessageBox.warning(self, "メディア追加エラー", f"メディアを追加できませんでした。\n{src}\n\n{exc}")
+                QMessageBox.warning(self, "素材追加エラー", f"素材を追加できませんでした。\n{src}\n\n{exc}")
         if added:
             self.refresh_images()
             self.refresh_prompt_list()
-            self.statusBar().showMessage(f"メディアを {added} 件追加しました")
+            self.statusBar().showMessage(f"素材を {added} 件追加しました")
 
-    def create_thumbnail(self, src: Path, image_id: int) -> Optional[Path]:
+    def ask_video_import_mode(self, src: Path) -> Optional[str]:
+        box = QMessageBox(self)
+        box.setWindowTitle("動画追加")
+        box.setText(f"動画をどう追加しますか？\n{src.name}")
+        thumb_button = box.addButton("サムネ画像のみ作成", QMessageBox.AcceptRole)
+        copy_button = box.addButton("動画をコピーして登録", QMessageBox.ActionRole)
+        cancel_button = box.addButton("キャンセル", QMessageBox.RejectRole)
+        box.setDefaultButton(thumb_button)
+        box.setEscapeButton(cancel_button)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked == thumb_button:
+            return "thumb"
+        if clicked == copy_button:
+            return "copy"
+        return None
+
+    def create_thumbnail(self, src: Path, image_id: int, prompt_id: int) -> Optional[Path]:
         pix = QPixmap(str(src))
         if pix.isNull():
             return None
         thumb = pix.scaled(320, 240, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        thumb_path = self.thumbs_dir / f"thumb_{image_id:08d}.png"
+        thumb_dir = self.prompt_thumbs_dir(prompt_id)
+        thumb_dir.mkdir(parents=True, exist_ok=True)
+        thumb_path = thumb_dir / f"thumb_{image_id:08d}.png"
         if thumb.save(str(thumb_path), "PNG"):
             return thumb_path
         return None
 
     def generate_video_snapshot(self, src: Path, prompt_asset_dir: Path) -> Path:
+        dest = unique_path(prompt_asset_dir / f"{normalize_file_stem(src.name)}.jpg")
+        self.write_video_frame_jpeg(src, dest, target_height=1080)
+        return dest
+
+    def create_video_thumbnail(self, src: Path, image_id: int, prompt_id: int) -> Optional[Path]:
+        thumb_dir = self.prompt_thumbs_dir(prompt_id)
+        thumb_dir.mkdir(parents=True, exist_ok=True)
+        thumb_path = thumb_dir / f"thumb_{image_id:08d}.jpg"
+        try:
+            self.write_video_frame_jpeg(src, thumb_path, target_height=360)
+            return thumb_path
+        except Exception:
+            return None
+
+    def write_video_frame_jpeg(self, src: Path, dest: Path, target_height: int = 1080) -> None:
         try:
             import cv2  # type: ignore
         except Exception as exc:
@@ -2232,18 +2406,42 @@ class MainWindow(QMainWindow):
             if height <= 0 or width <= 0:
                 raise RuntimeError("取得したフレームのサイズが不正です。")
 
-            target_height = 1080
             target_width = max(1, int(round(width * (target_height / float(height)))))
             if height != target_height:
                 frame = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_AREA if target_height < height else cv2.INTER_CUBIC)
 
-            dest = unique_path(prompt_asset_dir / f"{normalize_file_stem(src.name)}.jpg")
             ok = cv2.imwrite(str(dest), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
             if not ok:
                 raise RuntimeError("JPEGを書き出せませんでした。")
-            return dest
         finally:
             cap.release()
+
+    def create_extension_thumbnail(self, src: Path, image_id: int, prompt_id: int) -> Optional[Path]:
+        thumb_dir = self.prompt_thumbs_dir(prompt_id)
+        thumb_dir.mkdir(parents=True, exist_ok=True)
+        thumb_path = thumb_dir / f"thumb_{image_id:08d}.png"
+        ext = extension_label(src)
+        pix = QPixmap(320, 240)
+        bg = QColor(color_for_media_type(media_type_for_path(src)))
+        pix.fill(bg)
+        painter = QPainter(pix)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(QColor("#ffffff"))
+            font = QFont()
+            font.setBold(True)
+            font.setPointSize(44 if len(ext) <= 4 else 34)
+            painter.setFont(font)
+            painter.drawText(QRect(0, 55, 320, 95), Qt.AlignCenter, ext)
+            small_font = QFont()
+            small_font.setPointSize(16)
+            painter.setFont(small_font)
+            painter.drawText(QRect(0, 150, 320, 45), Qt.AlignCenter, "FILE")
+        finally:
+            painter.end()
+        if pix.save(str(thumb_path), "PNG"):
+            return thumb_path
+        return None
 
     def refresh_images(self) -> None:
         self.image_list.clear()
@@ -2254,8 +2452,11 @@ class MainWindow(QMainWindow):
             file_path = str(row["file_path"])
             thumb_path = str(row["thumbnail_path"] or file_path)
             cover = bool(row["is_cover"])
+            media_type = str(row["media_type"] if "media_type" in row.keys() else "image")
             stem = Path(file_path).stem
-            label = f"★ {stem}" if cover else stem
+            prefix = media_label(media_type)
+            label_text = f"{prefix} {stem}" if prefix else stem
+            label = f"★ {label_text}" if cover else label_text
             item = QListWidgetItem(label)
             item.setData(Qt.UserRole, image_id)
             item.setToolTip(file_path)
@@ -2281,7 +2482,7 @@ class MainWindow(QMainWindow):
             return
         old_path = Path(str(row["file_path"]))
         if not old_path.exists():
-            QMessageBox.warning(self, "ファイル名変更エラー", "画像ファイルが見つかりません。")
+            QMessageBox.warning(self, "ファイル名変更エラー", "素材ファイルが見つかりません。")
             return
         current_stem = old_path.stem
         new_name, ok = QInputDialog.getText(
@@ -2303,7 +2504,7 @@ class MainWindow(QMainWindow):
             self.db.update_image_file_path(image_id, str(new_path))
             self.refresh_images()
             self.refresh_prompt_list()
-            self.statusBar().showMessage(f"画像ファイル名を変更しました: {new_path.name}")
+            self.statusBar().showMessage(f"素材ファイル名を変更しました: {new_path.name}")
         except Exception as exc:
             QMessageBox.warning(self, "ファイル名変更エラー", str(exc))
 
@@ -2316,8 +2517,8 @@ class MainWindow(QMainWindow):
             return
         result = QMessageBox.question(
             self,
-            "画像削除確認",
-            "選択画像の登録を削除しますか？\n画像ファイルはWindowsのゴミ箱へ移動します。",
+            "素材削除確認",
+            "選択素材の登録を削除しますか？\n素材ファイルはWindowsのゴミ箱へ移動します。",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -2330,19 +2531,20 @@ class MainWindow(QMainWindow):
             recycle_targets.append(thumb_path)
 
         prompt_id = int(row["prompt_id"])
+        prompt_asset_dir = self.prompt_asset_dir(prompt_id)
         self.db.delete_image(image_id)
         if not self.db.list_images(prompt_id):
-            prompt_asset_dir = self.images_dir / f"prompt_{prompt_id:06d}"
             if prompt_asset_dir.exists():
-                recycle_targets.append(prompt_asset_dir)
+                recycle_targets = [prompt_asset_dir]
         moved, errors = move_paths_to_recycle_bin(recycle_targets)
+        remove_empty_dirs(prompt_asset_dir)
         self.refresh_images()
         self.refresh_prompt_list()
         if errors:
-            QMessageBox.warning(self, "画像削除警告", "登録は削除しましたが、一部ファイルをゴミ箱へ移動できませんでした。\n\n" + "\n".join(errors[:5]))
-            self.statusBar().showMessage(f"画像登録を削除しました。一部ファイル移動失敗: {len(errors)} 件")
+            QMessageBox.warning(self, "素材削除警告", "登録は削除しましたが、一部ファイルをゴミ箱へ移動できませんでした。\n\n" + "\n".join(errors[:5]))
+            self.statusBar().showMessage(f"素材登録を削除しました。一部ファイル移動失敗: {len(errors)} 件")
         else:
-            self.statusBar().showMessage(f"画像を削除しました。ゴミ箱へ移動: {moved} 件")
+            self.statusBar().showMessage(f"素材を削除しました。ゴミ箱へ移動: {moved} 件")
 
     def set_selected_image_as_cover(self) -> None:
         if self.current_prompt_id is None:
@@ -2353,7 +2555,7 @@ class MainWindow(QMainWindow):
         self.db.set_cover_image(self.current_prompt_id, image_id)
         self.refresh_images()
         self.refresh_prompt_list()
-        self.statusBar().showMessage("カバー画像を変更しました")
+        self.statusBar().showMessage("カバーを変更しました")
 
     def open_selected_image(self) -> None:
         image_id = self.selected_image_id()
@@ -2364,13 +2566,55 @@ class MainWindow(QMainWindow):
             return
         open_path(Path(str(row["file_path"])))
 
-    def open_current_image_folder(self) -> None:
+    def open_assets_folder(self) -> None:
+        self.assets_dir.mkdir(parents=True, exist_ok=True)
+        open_path(self.assets_dir)
+
+    def open_current_prompt_asset_folder(self) -> None:
         if self.current_prompt_id is None:
-            open_path(self.assets_dir)
+            self.open_assets_folder()
             return
-        folder = self.images_dir / f"prompt_{self.current_prompt_id:06d}"
-        folder.mkdir(parents=True, exist_ok=True)
-        open_path(folder)
+        prompt_dir = self.prompt_asset_dir(self.current_prompt_id)
+        prompt_dir.mkdir(parents=True, exist_ok=True)
+        open_path(prompt_dir)
+
+    def show_about_dialog(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("バージョン情報")
+        dialog.setModal(True)
+        layout = QVBoxLayout(dialog)
+        top = QHBoxLayout()
+
+        icon_label = QLabel()
+        icon = load_window_icon()
+        if not icon.isNull():
+            icon_label.setPixmap(icon.pixmap(64, 64))
+        icon_label.setFixedSize(72, 72)
+        icon_label.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
+        top.addWidget(icon_label)
+
+        info = QLabel(
+            f"<b>{APP_NAME} {APP_VERSION}</b><br><br>"
+            f"{APP_AUTHOR}<br>"
+            f"<a href='{APP_CONTACT_X}'>{APP_CONTACT_X}</a><br>"
+            f"<a href='{APP_REPOSITORY}'>{APP_REPOSITORY}</a><br><br>"
+            "MIT License"
+        )
+        info.setOpenExternalLinks(True)
+        info.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        top.addWidget(info, 1)
+        layout.addLayout(top)
+
+        ok_button = QPushButton("OK")
+        ok_button.setDefault(True)
+        ok_button.clicked.connect(dialog.accept)
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        button_row.addWidget(ok_button)
+        button_row.addStretch(1)
+        layout.addLayout(button_row)
+
+        dialog.exec()
 
     def dragEnterEvent(self, event):  # noqa: N802 - Qt naming
         if has_media_urls(event.mimeData()):
@@ -2649,6 +2893,20 @@ def move_paths_to_recycle_bin(paths: Iterable[Path]) -> tuple[int, list[str]]:
             errors.append(f"{path}: {exc}")
     return moved, errors
 
+
+def remove_empty_dirs(root: Path) -> None:
+    if not root.exists() or root.is_file():
+        return
+    for child in sorted([p for p in root.rglob("*") if p.is_dir()], key=lambda p: len(p.parts), reverse=True):
+        try:
+            child.rmdir()
+        except OSError:
+            pass
+    try:
+        root.rmdir()
+    except OSError:
+        pass
+
 def safe_filename(name: str) -> str:
     name = name.strip().replace("\x00", "")
     name = re.sub(r"[<>:\"/\\|?*]+", "_", name)
@@ -2675,6 +2933,54 @@ def unique_path(path: Path) -> Path:
         if not candidate.exists():
             return candidate
         idx += 1
+
+
+def extension_label(path: Path) -> str:
+    ext = path.suffix.lower().lstrip(".")
+    return (ext or "FILE").upper()[:8]
+
+
+def media_type_for_path(path: Path) -> str:
+    ext = path.suffix.lower()
+    if ext in SUPPORTED_IMAGE_EXTS:
+        return "image"
+    if ext in SUPPORTED_VIDEO_EXTS:
+        return "video"
+    if ext in AUDIO_EXTS:
+        return "audio"
+    if ext in ARCHIVE_EXTS:
+        return "archive"
+    if ext in DOCUMENT_EXTS:
+        return "document"
+    if ext in CODE_EXTS:
+        return "code"
+    if ext in TEXT_EXTS:
+        return "text"
+    return "file"
+
+
+def media_label(media_type: str) -> str:
+    return {
+        "video": "[VIDEO]",
+        "audio": "[AUDIO]",
+        "archive": "[ZIP]",
+        "document": "[DOC]",
+        "code": "[CODE]",
+        "text": "[TEXT]",
+        "file": "[FILE]",
+    }.get(media_type, "")
+
+
+def color_for_media_type(media_type: str) -> str:
+    return {
+        "video": "#334155",
+        "audio": "#7c3aed",
+        "archive": "#b45309",
+        "document": "#2563eb",
+        "code": "#047857",
+        "text": "#4b5563",
+        "file": "#374151",
+    }.get(media_type, "#374151")
 
 
 def icon_from_path(path: str, size: QSize) -> QIcon:
@@ -2708,7 +3014,7 @@ def media_paths_from_mime(mime_data) -> list[Path]:
         if not url.isLocalFile():
             continue
         path = Path(url.toLocalFile())
-        if path.is_file() and path.suffix.lower() in SUPPORTED_MEDIA_EXTS:
+        if path.is_file():
             paths.append(path)
     return paths
 
