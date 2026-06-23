@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-AI Prompt Organizer v20
+AI Prompt Organizer v25
 
 AI生成用プロンプトを、タイトル・タグ・説明・画像付きで管理するローカルGUIツール。
 PySide6 + SQLite で動作します。
@@ -69,7 +69,7 @@ except Exception as exc:  # pragma: no cover - 実行環境向けメッセージ
 
 
 APP_NAME = "AI Prompt Organizer"
-APP_VERSION = "v1.6.0"
+APP_VERSION = "v1.8.0"
 APP_AUTHOR = "MF235"
 APP_CONTACT_X = "https://x.com/MF235XBR"
 APP_REPOSITORY = "https://github.com/mf235/ai-prompt-organizer"
@@ -1048,6 +1048,296 @@ class ImageListWidget(QListWidget):
 
 
 
+class ImageViewerWindow(QWidget):
+    MODE_FRAMELESS = "frameless"
+    MODE_SCROLL = "scroll"
+    MODE_LABELS = {
+        MODE_FRAMELESS: "フレームレス表示",
+        MODE_SCROLL: "原寸スクロール表示",
+    }
+    RESIZE_MARGIN = 8
+
+    def __init__(self, main_window: "MainWindow", image_path: Path, mode: str = MODE_FRAMELESS):
+        super().__init__()
+        self.main_window = main_window
+        self.image_path = image_path
+        self.pixmap = QPixmap(str(image_path))
+        self.mode = mode if mode in self.MODE_LABELS else self.MODE_FRAMELESS
+        self.zoom_percent = 100
+        self.offset = QPoint(0, 0)
+        self._dragging_window = False
+        self._dragging_image = False
+        self._resizing = False
+        self._resize_edges = ""
+        self._press_global = QPoint(0, 0)
+        self._press_pos = QPoint(0, 0)
+        self._press_window_pos = QPoint(0, 0)
+        self._press_geom = QRect()
+        self._press_offset = QPoint(0, 0)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setMouseTracking(True)
+        self.setMinimumSize(80, 60)
+        self.setWindowTitle(image_path.name)
+        self.apply_mode(first=True)
+        self.resize_to_zoom()
+        self.move(self.main_window.next_viewer_position(self.size()))
+
+    def apply_mode(self, first: bool = False) -> None:
+        current_geometry = QRect(self.geometry())
+        was_visible = self.isVisible()
+        if not first and was_visible:
+            self.hide()
+
+        if self.mode == self.MODE_FRAMELESS:
+            self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
+        else:
+            # Let the platform apply the normal decorated window frame.
+            # Replacing a frameless top-level window with a newly shown decorated one is
+            # more reliable than trying to keep every title/close/minimize hint manually.
+            self.setWindowFlags(Qt.Window)
+        self.setWindowTitle(self.image_path.name)
+
+        if not first:
+            if current_geometry.isValid():
+                self.setGeometry(current_geometry)
+            self.showNormal()
+            self.raise_()
+            self.activateWindow()
+
+    def switch_mode(self, mode: str) -> None:
+        if mode not in self.MODE_LABELS or mode == self.mode:
+            return
+        if self.mode == self.MODE_FRAMELESS and mode == self.MODE_SCROLL:
+            self.main_window.replace_image_viewer_mode(self, mode)
+            return
+        self.mode = mode
+        self.apply_mode()
+        if self.mode == self.MODE_FRAMELESS:
+            self.resize_to_zoom()
+        else:
+            self.center_image_if_needed()
+        screen = QGuiApplication.primaryScreen()
+        center = screen.geometry().center() if screen is not None else QPoint(0, 0)
+        self.update_cursor(self.mapFromGlobal(center))
+        self.update()
+
+    def image_size_at_zoom(self) -> QSize:
+        if self.pixmap.isNull():
+            return QSize(320, 240)
+        return QSize(
+            max(1, int(round(self.pixmap.width() * self.zoom_percent / 100.0))),
+            max(1, int(round(self.pixmap.height() * self.zoom_percent / 100.0))),
+        )
+
+    def available_size(self) -> QSize:
+        screen = QGuiApplication.screenAt(self.frameGeometry().center()) or QGuiApplication.primaryScreen()
+        if screen is None:
+            return QSize(1280, 720)
+        rect = screen.availableGeometry()
+        return QSize(max(120, rect.width()), max(90, rect.height()))
+
+    def resize_to_zoom(self, clamp_to_screen: bool = True) -> None:
+        desired = self.image_size_at_zoom()
+        if clamp_to_screen:
+            avail = self.available_size()
+            if desired.width() > avail.width() or desired.height() > avail.height():
+                desired.scale(avail, Qt.KeepAspectRatio)
+        if self.mode == self.MODE_FRAMELESS:
+            self.resize(desired)
+        self.center_image_if_needed()
+
+    def center_image_if_needed(self) -> None:
+        img_size = self.image_size_at_zoom()
+        x = self.offset.x()
+        y = self.offset.y()
+        if img_size.width() <= self.width():
+            x = (self.width() - img_size.width()) // 2
+        else:
+            x = min(0, max(self.width() - img_size.width(), x))
+        if img_size.height() <= self.height():
+            y = (self.height() - img_size.height()) // 2
+        else:
+            y = min(0, max(self.height() - img_size.height(), y))
+        self.offset = QPoint(x, y)
+
+    def edge_at(self, pos: QPoint) -> str:
+        if self.mode != self.MODE_FRAMELESS:
+            return ""
+        m = self.RESIZE_MARGIN
+        edges = ""
+        if pos.x() <= m:
+            edges += "L"
+        elif pos.x() >= self.width() - m:
+            edges += "R"
+        if pos.y() <= m:
+            edges += "T"
+        elif pos.y() >= self.height() - m:
+            edges += "B"
+        return edges
+
+    def update_cursor(self, pos: QPoint) -> None:
+        edges = self.edge_at(pos)
+        if edges in ("L", "R"):
+            self.setCursor(Qt.SizeHorCursor)
+        elif edges in ("T", "B"):
+            self.setCursor(Qt.SizeVerCursor)
+        elif edges in ("LT", "RB"):
+            self.setCursor(Qt.SizeFDiagCursor)
+        elif edges in ("RT", "LB"):
+            self.setCursor(Qt.SizeBDiagCursor)
+        else:
+            self.setCursor(Qt.ArrowCursor)
+
+    def contextMenuEvent(self, event):  # noqa: N802 - Qt naming
+        menu = QMenu(self)
+        frameless_action = QAction(self.MODE_LABELS[self.MODE_FRAMELESS], self)
+        frameless_action.setCheckable(True)
+        frameless_action.setChecked(self.mode == self.MODE_FRAMELESS)
+        scroll_action = QAction(self.MODE_LABELS[self.MODE_SCROLL], self)
+        scroll_action.setCheckable(True)
+        scroll_action.setChecked(self.mode == self.MODE_SCROLL)
+        close_all_action = QAction("全て閉じる", self)
+        close_action = QAction("閉じる", self)
+        frameless_action.triggered.connect(lambda: self.switch_mode(self.MODE_FRAMELESS))
+        scroll_action.triggered.connect(lambda: self.switch_mode(self.MODE_SCROLL))
+        close_all_action.triggered.connect(self.main_window.close_all_image_viewers)
+        close_action.triggered.connect(self.close)
+        menu.addAction(frameless_action)
+        menu.addAction(scroll_action)
+        menu.addSeparator()
+        menu.addAction(close_all_action)
+        menu.addAction(close_action)
+        menu.exec(event.globalPos())
+
+    def keyPressEvent(self, event):  # noqa: N802 - Qt naming
+        if event.key() == Qt.Key_Escape:
+            self.close()
+            return
+        super().keyPressEvent(event)
+
+    def wheelEvent(self, event):  # noqa: N802 - Qt naming
+        if event.modifiers() & Qt.ControlModifier:
+            delta = event.angleDelta().y()
+            if delta == 0:
+                return
+            self.zoom_percent = max(10, min(500, self.zoom_percent + (10 if delta > 0 else -10)))
+            if self.mode == self.MODE_FRAMELESS:
+                self.resize_to_zoom(clamp_to_screen=False)
+            else:
+                self.center_image_if_needed()
+            self.update()
+            event.accept()
+            return
+        super().wheelEvent(event)
+
+    def mousePressEvent(self, event):  # noqa: N802 - Qt naming
+        if event.button() == Qt.LeftButton:
+            self._press_global = event.globalPosition().toPoint()
+            self._press_pos = event.position().toPoint()
+            self._press_window_pos = self.pos()
+            self._press_geom = self.geometry()
+            self._press_offset = QPoint(self.offset)
+            if self.mode == self.MODE_FRAMELESS:
+                edges = self.edge_at(self._press_pos)
+                if edges:
+                    self._resizing = True
+                    self._resize_edges = edges
+                else:
+                    self._dragging_window = True
+            else:
+                self._dragging_image = True
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):  # noqa: N802 - Qt naming
+        pos = event.position().toPoint()
+        global_pos = event.globalPosition().toPoint()
+        if self._dragging_window:
+            self.move(self._press_window_pos + (global_pos - self._press_global))
+            event.accept()
+            return
+        if self._dragging_image:
+            self.offset = self._press_offset + (pos - self._press_pos)
+            self.center_image_if_needed()
+            self.update()
+            event.accept()
+            return
+        if self._resizing:
+            self.resize_frameless(global_pos)
+            event.accept()
+            return
+        self.update_cursor(pos)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):  # noqa: N802 - Qt naming
+        self._dragging_window = False
+        self._dragging_image = False
+        self._resizing = False
+        self._resize_edges = ""
+        super().mouseReleaseEvent(event)
+
+    def resize_frameless(self, global_pos: QPoint) -> None:
+        if self.pixmap.isNull():
+            return
+        geom = QRect(self._press_geom)
+        dx = global_pos.x() - self._press_global.x()
+        dy = global_pos.y() - self._press_global.y()
+        ratio = self.pixmap.width() / max(1, self.pixmap.height())
+        if "L" in self._resize_edges:
+            new_w = geom.width() - dx
+        elif "R" in self._resize_edges:
+            new_w = geom.width() + dx
+        else:
+            if "T" in self._resize_edges:
+                new_w = int(round((geom.height() - dy) * ratio))
+            else:
+                new_w = int(round((geom.height() + dy) * ratio))
+        new_w = max(80, new_w)
+        new_h = max(60, int(round(new_w / ratio)))
+        avail = self.available_size()
+        if new_w > avail.width() or new_h > avail.height():
+            size = QSize(new_w, new_h)
+            size.scale(avail, Qt.KeepAspectRatio)
+            new_w, new_h = size.width(), size.height()
+        new_x = geom.x()
+        new_y = geom.y()
+        if "L" in self._resize_edges:
+            new_x = geom.right() - new_w + 1
+        if "T" in self._resize_edges:
+            new_y = geom.bottom() - new_h + 1
+        self.setGeometry(new_x, new_y, new_w, new_h)
+        self.update()
+
+    def resizeEvent(self, event):  # noqa: N802 - Qt naming
+        if self.mode == self.MODE_FRAMELESS and not self.pixmap.isNull():
+            ratio = self.pixmap.width() / max(1, self.pixmap.height())
+            expected_h = max(1, int(round(self.width() / ratio)))
+            if abs(expected_h - self.height()) > 1 and not self._resizing:
+                self.resize(self.width(), expected_h)
+        self.center_image_if_needed()
+        super().resizeEvent(event)
+
+    def paintEvent(self, event):  # noqa: N802 - Qt naming
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(20, 20, 20))
+        if self.pixmap.isNull():
+            painter.setPen(QColor(240, 240, 240))
+            painter.drawText(self.rect(), Qt.AlignCenter, "画像を表示できません")
+            return
+        if self.mode == self.MODE_FRAMELESS:
+            painter.drawPixmap(self.rect(), self.pixmap)
+        else:
+            img_size = self.image_size_at_zoom()
+            target = QRect(self.offset, img_size)
+            painter.drawPixmap(target, self.pixmap)
+
+    def closeEvent(self, event):  # noqa: N802 - Qt naming
+        self.main_window.save_image_viewer_position(self.pos())
+        self.main_window.unregister_image_viewer(self)
+        super().closeEvent(event)
+
+
 class CollapsibleGroupBox(QGroupBox):
     collapsedChanged = Signal(str, bool)
 
@@ -1516,6 +1806,8 @@ class MainWindow(QMainWindow):
         self.warned_invalid_image_folder_files: set[str] = set()
         self.current_font_size = max(9, min(25, safe_int(self.db.get_setting("font_size", "10"), 10)))
         self.font_size_actions: dict[int, QAction] = {}
+        self.image_viewers: list[ImageViewerWindow] = []
+        self._viewer_open_offset = 0
 
         self.setWindowTitle(APP_NAME)
         self.apply_window_icon()
@@ -1841,20 +2133,15 @@ class MainWindow(QMainWindow):
 
     def build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("ファイル")
-        save_action = QAction("保存", self)
-        save_action.setShortcut(QKeySequence.Save)
         open_assets_action = QAction("素材フォルダを開く", self)
         backup_action = QAction("バックアップ実行", self)
         open_backup_action = QAction("バックアップフォルダを開く", self)
         quit_action = QAction("終了", self)
         quit_action.setShortcut(QKeySequence.Quit)
-        save_action.triggered.connect(self.save_current_prompt)
         open_assets_action.triggered.connect(self.open_assets_folder)
         backup_action.triggered.connect(self.run_manual_backup)
         open_backup_action.triggered.connect(self.open_backup_folder)
         quit_action.triggered.connect(self.close)
-        file_menu.addAction(save_action)
-        file_menu.addSeparator()
         file_menu.addAction(open_assets_action)
         file_menu.addAction(open_backup_action)
         file_menu.addSeparator()
@@ -1863,6 +2150,9 @@ class MainWindow(QMainWindow):
         file_menu.addAction(quit_action)
 
         edit_menu = self.menuBar().addMenu("編集")
+        save_action = QAction("保存", self)
+        save_action.setShortcut(QKeySequence.Save)
+        save_action.triggered.connect(self.save_current_prompt)
         new_action = QAction("新規", self)
         new_action.setShortcut(QKeySequence.New)
         new_action.triggered.connect(self.new_prompt)
@@ -1882,6 +2172,8 @@ class MainWindow(QMainWindow):
         copy_full_action.triggered.connect(self.copy_full_prompt)
         tag_manage_action = QAction("タグ管理", self)
         tag_manage_action.triggered.connect(self.open_tag_manager)
+        edit_menu.addAction(save_action)
+        edit_menu.addSeparator()
         edit_menu.addAction(new_action)
         edit_menu.addAction(duplicate_action)
         edit_menu.addAction(delete_action)
@@ -2844,7 +3136,81 @@ class MainWindow(QMainWindow):
         row = self.db.get_image(image_id)
         if not row:
             return
-        open_path(Path(str(row["file_path"])))
+        path = Path(str(row["file_path"]))
+        if path.suffix.lower() in SUPPORTED_IMAGE_EXTS:
+            self.open_image_viewer(path)
+        else:
+            open_path(path)
+
+    def open_image_viewer(self, path: Path) -> None:
+        if not path.exists():
+            QMessageBox.warning(self, "画像表示エラー", "画像ファイルが見つかりません。")
+            return
+        viewer = ImageViewerWindow(self, path, ImageViewerWindow.MODE_FRAMELESS)
+        self.image_viewers.append(viewer)
+        viewer.show()
+        viewer.activateWindow()
+
+    def replace_image_viewer_mode(self, old_viewer: ImageViewerWindow, mode: str) -> None:
+        geometry = QRect(old_viewer.geometry())
+        zoom_percent = old_viewer.zoom_percent
+        offset = QPoint(old_viewer.offset)
+        image_path = old_viewer.image_path
+        if old_viewer in self.image_viewers:
+            self.image_viewers.remove(old_viewer)
+        old_viewer.close()
+
+        viewer = ImageViewerWindow(self, image_path, mode)
+        viewer.zoom_percent = zoom_percent
+        viewer.offset = offset
+        if geometry.isValid():
+            if mode == ImageViewerWindow.MODE_SCROLL:
+                geometry = self.keep_rect_on_screen(geometry)
+            viewer.setGeometry(geometry)
+        if mode == ImageViewerWindow.MODE_FRAMELESS:
+            viewer.resize_to_zoom()
+        else:
+            viewer.center_image_if_needed()
+        self.image_viewers.append(viewer)
+        viewer.showNormal()
+        viewer.raise_()
+        viewer.activateWindow()
+        QTimer.singleShot(0, viewer.showNormal)
+
+    def unregister_image_viewer(self, viewer: ImageViewerWindow) -> None:
+        if viewer in self.image_viewers:
+            self.image_viewers.remove(viewer)
+
+    def close_all_image_viewers(self) -> None:
+        for viewer in list(self.image_viewers):
+            viewer.close()
+
+    def save_image_viewer_position(self, pos: QPoint) -> None:
+        self.db.set_setting("image_viewer_x", str(pos.x()))
+        self.db.set_setting("image_viewer_y", str(pos.y()))
+
+    def keep_rect_on_screen(self, rect: QRect) -> QRect:
+        screen = QGuiApplication.screenAt(rect.center()) or QGuiApplication.primaryScreen()
+        available = screen.availableGeometry() if screen is not None else QRect(0, 0, 1280, 720)
+        width = min(max(80, rect.width()), available.width())
+        height = min(max(60, rect.height()), available.height())
+        x = min(max(available.x(), rect.x()), available.right() - width + 1)
+        y = min(max(available.y(), rect.y()), available.bottom() - height + 1)
+        return QRect(x, y, width, height)
+
+    def next_viewer_position(self, size: QSize) -> QPoint:
+        screen = QGuiApplication.primaryScreen()
+        available = screen.availableGeometry() if screen is not None else QRect(0, 0, 1280, 720)
+        default_x = available.x() + max(0, (available.width() - size.width()) // 2)
+        default_y = available.y() + max(0, (available.height() - size.height()) // 2)
+        x = safe_int(self.db.get_setting("image_viewer_x", ""), default_x)
+        y = safe_int(self.db.get_setting("image_viewer_y", ""), default_y)
+        # Restore the saved position exactly for the first viewer.
+        # Only additional simultaneous viewers are offset, so repeated open/close
+        # does not drift farther from the saved position.
+        offset = len(self.image_viewers) * 30
+        rect = self.keep_rect_on_screen(QRect(x + offset, y + offset, size.width(), size.height()))
+        return rect.topLeft()
 
     def open_backup_folder(self) -> None:
         self.backup_dir.mkdir(parents=True, exist_ok=True)
@@ -2924,6 +3290,7 @@ class MainWindow(QMainWindow):
         if not self.maybe_save_dirty():
             event.ignore()
             return
+        self.close_all_image_viewers()
         self.save_ui_state()
         self.db.close()
         event.accept()
