@@ -9,7 +9,7 @@ import zipfile
 from pathlib import Path
 
 APP_NAME = "ai-prompt-organizer"
-APP_VERSION = "v1.12.1"
+APP_VERSION = "v1.16.3"
 ROOT_DIR = Path(__file__).resolve().parent
 SOURCE_SCRIPT = ROOT_DIR / f"{APP_NAME}.py"
 OUTPUT_DIR = ROOT_DIR / APP_NAME
@@ -21,6 +21,15 @@ RESOURCES_DIR = ROOT_DIR / "resources"
 EXE_ICON = RESOURCES_DIR / "icons" / "app.ico"
 WINDOW_ICON = RESOURCES_DIR / "icons" / "window.png"
 PYINSTALLER_CACHE_DIR = ROOT_DIR / f".pyinstaller-cache-{APP_VERSION}"
+APP_GENERATED_ICON = BUILD_DIR / "ai-prompt-organizer.ico"
+LAUNCHER_SOURCE = ROOT_DIR / "apo-open.c"
+LAUNCHER_RESOURCE = ROOT_DIR / "apo-open.rc"
+LAUNCHER_EXE_NAME = "apo-open.exe"
+LAUNCHER_ROOT_EXE = ROOT_DIR / LAUNCHER_EXE_NAME
+LAUNCHER_ROOT_RES = ROOT_DIR / "apo-open.res"
+LAUNCHER_ROOT_RES_OBJ = ROOT_DIR / "apo-open-resource.o"
+LAUNCHER_GENERATED_ICON = DIST_DIR / "apo-open.ico"
+LAUNCHER_GENERATED_RESOURCE = DIST_DIR / "apo-open-generated.rc"
 
 
 def log(message: str) -> None:
@@ -83,9 +92,42 @@ def find_source_script() -> Path:
     raise AssertionError("unreachable")
 
 
+def create_multisize_icon(output_path: Path, label: str) -> Path:
+    """Create a multi-size ICO from resources/icons/app.ico for EXE embedding."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if not ensure_optional_pillow():
+        return EXE_ICON
+
+    try:
+        from PIL import Image
+
+        image = Image.open(EXE_ICON)
+        try:
+            sizes = sorted(image.ico.sizes())  # type: ignore[attr-defined]
+            if sizes:
+                image = image.ico.getimage(sizes[-1])  # type: ignore[attr-defined]
+            else:
+                image.load()
+        except Exception:
+            image.load()
+
+        image = image.convert("RGBA")
+        icon_sizes = [(16, 16), (20, 20), (24, 24), (32, 32), (40, 40), (48, 48), (64, 64), (128, 128), (256, 256)]
+        image.save(str(output_path), format="ICO", sizes=icon_sizes)
+        if output_path.exists():
+            log(f"[INFO] {label} multi-size icon: {output_path}")
+            return output_path
+    except Exception as exc:
+        log(f"[WARN] Failed to create {label} multi-size icon: {exc}")
+
+    return EXE_ICON
+
+
 def build_exe(source_script: Path) -> None:
     env = os.environ.copy()
     env["PYINSTALLER_CONFIG_DIR"] = str(PYINSTALLER_CACHE_DIR)
+
+    app_icon = create_multisize_icon(APP_GENERATED_ICON, "Main EXE")
 
     add_data_arg = f"{RESOURCES_DIR}{os.pathsep}resources"
     command = [
@@ -105,7 +147,7 @@ def build_exe(source_script: Path) -> None:
         "--specpath",
         str(ROOT_DIR),
         "--icon",
-        str(EXE_ICON),
+        str(app_icon),
         "--add-data",
         add_data_arg,
         "--hidden-import",
@@ -121,6 +163,112 @@ def build_exe(source_script: Path) -> None:
         fail("PyInstaller build failed.")
 
 
+
+def ensure_optional_pillow() -> bool:
+    try:
+        __import__("PIL")
+        return True
+    except Exception:
+        pass
+
+    log("[INFO] Pillow was not found. Installing for launcher multi-size icon generation...")
+    install = subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "Pillow"])
+    if install.returncode != 0:
+        log("[WARN] Failed to install Pillow. Launcher will use the original ICO.")
+        return False
+    try:
+        __import__("PIL")
+        return True
+    except Exception:
+        log("[WARN] Pillow is still unavailable. Launcher will use the original ICO.")
+        return False
+
+
+def create_launcher_multisize_icon() -> Path:
+    """Create a multi-size ICO for apo-open.exe."""
+    return create_multisize_icon(LAUNCHER_GENERATED_ICON, "Launcher")
+
+
+def write_launcher_resource(icon_path: Path) -> Path:
+    DIST_DIR.mkdir(parents=True, exist_ok=True)
+    icon_text = str(icon_path.resolve()).replace("\\", "\\\\")
+    LAUNCHER_GENERATED_RESOURCE.write_text(f'IDI_ICON1 ICON "{icon_text}"\n', encoding="utf-8")
+    return LAUNCHER_GENERATED_RESOURCE
+
+
+def build_launcher() -> None:
+    if not LAUNCHER_SOURCE.exists():
+        log(f"[INFO] Launcher source was not found, skipping: {LAUNCHER_SOURCE.name}")
+        return
+
+    DIST_DIR.mkdir(parents=True, exist_ok=True)
+    launcher_exe = DIST_DIR / LAUNCHER_EXE_NAME
+    compiler_cl = shutil.which("cl")
+    compiler_gcc = shutil.which("gcc")
+    rc_exe = shutil.which("rc")
+    windres_exe = shutil.which("windres")
+    launcher_res = DIST_DIR / "apo-open.res"
+    launcher_res_obj = DIST_DIR / "apo-open-resource.o"
+    launcher_icon = create_launcher_multisize_icon()
+    launcher_resource = write_launcher_resource(launcher_icon)
+
+    if compiler_cl:
+        resource_arg: list[str] = []
+        if launcher_resource.exists() and rc_exe:
+            rc_result = subprocess.run([rc_exe, "/nologo", f"/fo{launcher_res}", str(launcher_resource)])
+            if rc_result.returncode == 0 and launcher_res.exists():
+                resource_arg = [str(launcher_res)]
+            else:
+                log("[WARN] Launcher resource compile failed. Launcher icon may be missing.")
+        elif launcher_resource.exists():
+            log("[WARN] rc.exe was not found. Launcher icon may be missing.")
+        command = [
+            compiler_cl,
+            "/nologo",
+            "/O2",
+            "/DUNICODE",
+            "/D_UNICODE",
+            f"/Fe:{launcher_exe}",
+            str(LAUNCHER_SOURCE),
+            *resource_arg,
+            "shell32.lib",
+            "user32.lib",
+            "/link",
+            "/SUBSYSTEM:WINDOWS",
+        ]
+    elif compiler_gcc:
+        resource_arg = []
+        if launcher_resource.exists() and windres_exe:
+            rc_result = subprocess.run([windres_exe, str(launcher_resource), str(launcher_res_obj)])
+            if rc_result.returncode == 0 and launcher_res_obj.exists():
+                resource_arg = [str(launcher_res_obj)]
+            else:
+                log("[WARN] Launcher resource compile failed. Launcher icon may be missing.")
+        elif launcher_resource.exists():
+            log("[WARN] windres was not found. Launcher icon may be missing.")
+        command = [
+            compiler_gcc,
+            "-O2",
+            "-municode",
+            "-mwindows",
+            "-o",
+            str(launcher_exe),
+            str(LAUNCHER_SOURCE),
+            *resource_arg,
+            "-lshell32",
+            "-luser32",
+        ]
+    else:
+        log("[WARN] cl/gcc was not found. Launcher EXE will not be included in the release ZIP.")
+        log("[WARN] You can build it manually with build-apo-open.bat.")
+        return
+
+    log("[INFO] Building lightweight launcher...")
+    result = subprocess.run(command)
+    if result.returncode != 0 or not launcher_exe.exists():
+        log("[WARN] Launcher build failed. Release ZIP will continue without apo-open.exe.")
+
+
 def create_zip() -> None:
     exe_path = DIST_DIR / f"{APP_NAME}.exe"
     if not exe_path.exists():
@@ -128,6 +276,9 @@ def create_zip() -> None:
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     shutil.copy2(exe_path, OUTPUT_DIR / f"{APP_NAME}.exe")
+    launcher_exe = DIST_DIR / LAUNCHER_EXE_NAME
+    if launcher_exe.exists():
+        shutil.copy2(launcher_exe, OUTPUT_DIR / LAUNCHER_EXE_NAME)
 
     with zipfile.ZipFile(ZIP_PATH, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
         for file_path in sorted(OUTPUT_DIR.rglob("*")):
@@ -136,7 +287,16 @@ def create_zip() -> None:
 
 
 def clean_generated_build_files_after_zip() -> None:
-    for path in [OUTPUT_DIR, BUILD_DIR, DIST_DIR, SPEC_PATH, PYINSTALLER_CACHE_DIR]:
+    for path in [
+        OUTPUT_DIR,
+        BUILD_DIR,
+        DIST_DIR,
+        SPEC_PATH,
+        PYINSTALLER_CACHE_DIR,
+        LAUNCHER_ROOT_EXE,
+        LAUNCHER_ROOT_RES,
+        LAUNCHER_ROOT_RES_OBJ,
+    ]:
         remove_path(path)
 
 
@@ -169,11 +329,22 @@ def main() -> int:
 
     log("")
     log("[INFO] Cleaning old build files...")
-    for path in [OUTPUT_DIR, ZIP_PATH, BUILD_DIR, DIST_DIR, SPEC_PATH, PYINSTALLER_CACHE_DIR]:
+    for path in [
+        OUTPUT_DIR,
+        ZIP_PATH,
+        BUILD_DIR,
+        DIST_DIR,
+        SPEC_PATH,
+        PYINSTALLER_CACHE_DIR,
+        LAUNCHER_ROOT_EXE,
+        LAUNCHER_ROOT_RES,
+        LAUNCHER_ROOT_RES_OBJ,
+    ]:
         remove_path(path)
 
     log("")
     build_exe(source_script)
+    build_launcher()
 
     log("")
     log("[INFO] Creating ZIP...")
@@ -189,7 +360,12 @@ def main() -> int:
     log("========================================")
     log(f"ZIP: {ZIP_PATH}")
     log("Contents:")
-    log(f"  {APP_NAME}/{APP_NAME}.exe")
+    try:
+        with zipfile.ZipFile(ZIP_PATH) as zf:
+            for name in sorted(zf.namelist()):
+                log(f"  {name}")
+    except Exception:
+        log(f"  {APP_NAME}/{APP_NAME}.exe")
     log("")
     log("Generated build folders were cleaned. Only the ZIP is left as the build output.")
     log("If Explorer still shows an old icon, extract the ZIP to a new folder.")

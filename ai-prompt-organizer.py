@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-AI Prompt Organizer v36
+AI Prompt Organizer v45
 
 AI生成用プロンプトを、タイトル・タグ・説明・画像付きで管理するローカルGUIツール。
 PySide6 + SQLite で動作します。
@@ -28,7 +28,8 @@ from typing import Callable, Iterable, Optional
 
 try:
     from PySide6.QtCore import QLockFile, QMimeData, QPoint, QRect, QSize, Qt, QTimer, QUrl, Signal
-    from PySide6.QtGui import QAction, QActionGroup, QColor, QDrag, QFont, QGuiApplication, QIcon, QKeySequence, QPainter, QPixmap, QPixmapCache
+    from PySide6.QtNetwork import QLocalServer, QLocalSocket
+    from PySide6.QtGui import QAction, QActionGroup, QColor, QCursor, QDrag, QFont, QGuiApplication, QIcon, QImage, QKeySequence, QPainter, QPixmap, QPixmapCache
     from PySide6.QtWidgets import (
         QApplication,
         QAbstractItemView,
@@ -55,6 +56,7 @@ try:
         QSplitter,
         QSpinBox,
         QStatusBar,
+        QSystemTrayIcon,
         QTabWidget,
         QTextEdit,
         QToolButton,
@@ -69,11 +71,16 @@ except Exception as exc:  # pragma: no cover - 実行環境向けメッセージ
 
 
 APP_NAME = "AI Prompt Organizer"
-APP_VERSION = "v1.12.1"
+APP_VERSION = "v1.16.3"
 APP_AUTHOR = "MF235"
 APP_CONTACT_X = "https://x.com/MF235XBR"
 APP_REPOSITORY = "https://github.com/mf235/ai-prompt-organizer"
 APP_USER_MODEL_ID = "chappy.ai-prompt-organizer"
+APP_IPC_SERVER_NAME = "chappy.ai-prompt-organizer.ipc"
+GLOBAL_HOTKEY_ID = 0x4131
+GLOBAL_HOTKEY_SETTING_KEY = "global_hotkey_shift_alt_a"
+STARTUP_ARG = "--startup"
+STARTUP_SHORTCUT_NAME = "AI Prompt Organizer.lnk"
 WINDOW_ICON_RELATIVE = ("resources", "icons", "window.png")
 EXE_ICON_RELATIVE = ("resources", "icons", "app.ico")
 DB_FILENAME = "prompt_organizer.db"
@@ -87,6 +94,14 @@ AUDIO_EXTS = {".wav", ".mp3", ".ogg", ".flac", ".m4a"}
 TEXT_EXTS = {".txt", ".md", ".json", ".csv", ".yaml", ".yml", ".xml", ".html", ".css", ".js", ".py"}
 DOCUMENT_EXTS = {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx"}
 CODE_EXTS = {".py", ".js", ".ts", ".html", ".css", ".cpp", ".c", ".h", ".cs", ".java", ".rs", ".go"}
+IMAGE_VIEWER_RESIZE_METHODS = [
+    ("nearest", "Nearest（軽量）"),
+    ("smooth", "Smooth（標準）"),
+    ("bicubic", "Bicubic（高品質）"),
+    ("lanczos", "Lanczos（最高品質）"),
+]
+IMAGE_VIEWER_RESIZE_METHOD_KEYS = {key for key, _label in IMAGE_VIEWER_RESIZE_METHODS}
+DEFAULT_IMAGE_VIEWER_RESIZE_METHOD = "bicubic"
 
 
 DEFAULT_CATEGORY_COLORS = {
@@ -1077,6 +1092,13 @@ class ImageListWidget(QListWidget):
             drag.setHotSpot(QPoint(min(thumb.width() // 2, 32), min(thumb.height() // 2, 32)))
         drag.exec(Qt.CopyAction)
 
+    def keyPressEvent(self, event):  # noqa: N802 - Qt naming
+        if event.key() == Qt.Key_F2:
+            self.main_window.rename_selected_image()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def dragEnterEvent(self, event):  # noqa: N802 - Qt naming
         if has_media_urls(event.mimeData()):
             event.acceptProposedAction()
@@ -1108,10 +1130,11 @@ class ImageViewerWindow(QWidget):
     }
     RESIZE_MARGIN = 8
 
-    def __init__(self, main_window: "MainWindow", image_path: Path, mode: str = MODE_FRAMELESS):
+    def __init__(self, main_window: "MainWindow", image_path: Path, mode: str = MODE_FRAMELESS, external_image: bool = False):
         super().__init__()
         self.main_window = main_window
         self.image_path = image_path
+        self.external_image = bool(external_image)
         self.pixmap = QPixmap(str(image_path))
         self.mode = mode if mode in self.MODE_LABELS else self.MODE_FRAMELESS
         self.zoom_percent = 100
@@ -1125,6 +1148,8 @@ class ImageViewerWindow(QWidget):
         self._press_window_pos = QPoint(0, 0)
         self._press_geom = QRect()
         self._press_offset = QPoint(0, 0)
+        self._scaled_pixmap_cache: dict[tuple[str, int, int, int], QPixmap] = {}
+        self._scaled_pixmap_cache_order: list[tuple[str, int, int, int]] = []
         self.setFocusPolicy(Qt.StrongFocus)
         self.setMouseTracking(True)
         self.setMinimumSize(80, 60)
@@ -1132,6 +1157,10 @@ class ImageViewerWindow(QWidget):
         self.apply_mode(first=True)
         self.resize_to_zoom()
         self.move(self.main_window.next_viewer_position(self.size()))
+
+    def clear_scaled_cache(self) -> None:
+        self._scaled_pixmap_cache.clear()
+        self._scaled_pixmap_cache_order.clear()
 
     def apply_mode(self, first: bool = False) -> None:
         current_geometry = QRect(self.geometry())
@@ -1211,6 +1240,31 @@ class ImageViewerWindow(QWidget):
             y = min(0, max(self.height() - img_size.height(), y))
         self.offset = QPoint(x, y)
 
+    def set_zoom_percent(self, zoom_percent: int) -> None:
+        zoom_percent = max(10, min(2000, int(zoom_percent)))
+        if zoom_percent == self.zoom_percent:
+            return
+        old_zoom = max(1, self.zoom_percent)
+        if self.mode == self.MODE_SCROLL and not self.pixmap.isNull():
+            center_x = self.width() / 2.0
+            center_y = self.height() / 2.0
+            source_x = (center_x - self.offset.x()) * 100.0 / old_zoom
+            source_y = (center_y - self.offset.y()) * 100.0 / old_zoom
+            self.zoom_percent = zoom_percent
+            new_x = int(round(center_x - source_x * self.zoom_percent / 100.0))
+            new_y = int(round(center_y - source_y * self.zoom_percent / 100.0))
+            self.offset = QPoint(new_x, new_y)
+            self.center_image_if_needed()
+        elif self.mode == self.MODE_FRAMELESS:
+            old_center = self.frameGeometry().center()
+            self.zoom_percent = zoom_percent
+            self.resize_to_zoom(clamp_to_screen=False)
+            self.move(old_center - QPoint(self.frameGeometry().width() // 2, self.frameGeometry().height() // 2))
+        else:
+            self.zoom_percent = zoom_percent
+            self.center_image_if_needed()
+        self.update()
+
     def edge_at(self, pos: QPoint) -> str:
         if self.mode != self.MODE_FRAMELESS:
             return ""
@@ -1255,10 +1309,20 @@ class ImageViewerWindow(QWidget):
         close_action.triggered.connect(self.close)
         menu.addAction(frameless_action)
         menu.addAction(scroll_action)
+        if self.external_image:
+            add_menu = menu.addMenu("素材へ追加")
+            add_current_action = QAction("現在のカードへ追加", self)
+            add_current_action.setEnabled(self.main_window.current_prompt_id is not None)
+            add_new_action = QAction("新規カードを作って追加", self)
+            add_current_action.triggered.connect(lambda: self.main_window.add_external_image_to_current_prompt(self.image_path))
+            add_new_action.triggered.connect(lambda: self.main_window.add_external_image_to_new_prompt(self.image_path))
+            add_menu.addAction(add_current_action)
+            add_menu.addAction(add_new_action)
         menu.addSeparator()
         menu.addAction(close_all_action)
         menu.addAction(close_action)
-        menu.exec(event.globalPos())
+        global_pos = event.globalPosition().toPoint() if hasattr(event, "globalPosition") else event.globalPos()
+        menu.exec(global_pos)
 
     def keyPressEvent(self, event):  # noqa: N802 - Qt naming
         if event.key() == Qt.Key_Escape:
@@ -1267,19 +1331,17 @@ class ImageViewerWindow(QWidget):
         super().keyPressEvent(event)
 
     def wheelEvent(self, event):  # noqa: N802 - Qt naming
-        if event.modifiers() & Qt.ControlModifier:
-            delta = event.angleDelta().y()
-            if delta == 0:
-                return
-            self.zoom_percent = max(10, min(500, self.zoom_percent + (10 if delta > 0 else -10)))
-            if self.mode == self.MODE_FRAMELESS:
-                self.resize_to_zoom(clamp_to_screen=False)
-            else:
-                self.center_image_if_needed()
-            self.update()
-            event.accept()
+        delta = event.angleDelta().y()
+        if delta == 0:
+            super().wheelEvent(event)
             return
-        super().wheelEvent(event)
+        steps = delta / 120.0
+        factor = 1.1 ** steps
+        new_zoom = int(round(self.zoom_percent * factor))
+        if new_zoom == self.zoom_percent:
+            new_zoom += 1 if delta > 0 else -1
+        self.set_zoom_percent(new_zoom)
+        event.accept()
 
     def mousePressEvent(self, event):  # noqa: N802 - Qt naming
         if event.button() == Qt.LeftButton:
@@ -1369,6 +1431,52 @@ class ImageViewerWindow(QWidget):
         self.center_image_if_needed()
         super().resizeEvent(event)
 
+    def scaled_pixmap_for_target(self, target_size: QSize, method: str) -> QPixmap:
+        width = max(1, target_size.width())
+        height = max(1, target_size.height())
+        cache_key = (method, int(self.pixmap.cacheKey()), width, height)
+        cached = self._scaled_pixmap_cache.get(cache_key)
+        if cached is not None and not cached.isNull():
+            return cached
+        pixmap = QPixmap()
+        try:
+            import cv2  # type: ignore
+            import numpy as np  # type: ignore
+
+            qimage = self.pixmap.toImage().convertToFormat(QImage.Format_RGBA8888)
+            source_width = qimage.width()
+            source_height = qimage.height()
+            source = np.frombuffer(qimage.bits(), dtype=np.uint8).reshape((source_height, source_width, 4))
+            interpolation = cv2.INTER_LANCZOS4 if method == "lanczos" else cv2.INTER_CUBIC
+            resized = cv2.resize(source, (width, height), interpolation=interpolation)
+            resized = np.ascontiguousarray(resized)
+            out_image = QImage(resized.data, width, height, width * 4, QImage.Format_RGBA8888).copy()
+            pixmap = QPixmap.fromImage(out_image)
+        except Exception:
+            pixmap = self.pixmap.scaled(target_size, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        if pixmap.isNull():
+            pixmap = self.pixmap.scaled(target_size, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        self._scaled_pixmap_cache[cache_key] = pixmap
+        self._scaled_pixmap_cache_order.append(cache_key)
+        while len(self._scaled_pixmap_cache_order) > 8:
+            old_key = self._scaled_pixmap_cache_order.pop(0)
+            self._scaled_pixmap_cache.pop(old_key, None)
+        return pixmap
+
+    def draw_scaled_pixmap(self, painter: QPainter, target: QRect) -> None:
+        if target.width() <= 0 or target.height() <= 0:
+            return
+        method = normalize_image_viewer_resize_method(self.main_window.image_viewer_resize_method)
+        if method == "nearest":
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, False)
+            painter.drawPixmap(target, self.pixmap)
+        elif method == "smooth":
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            painter.drawPixmap(target, self.pixmap)
+        else:
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, False)
+            painter.drawPixmap(target.topLeft(), self.scaled_pixmap_for_target(target.size(), method))
+
     def paintEvent(self, event):  # noqa: N802 - Qt naming
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor(20, 20, 20))
@@ -1377,11 +1485,11 @@ class ImageViewerWindow(QWidget):
             painter.drawText(self.rect(), Qt.AlignCenter, "画像を表示できません")
             return
         if self.mode == self.MODE_FRAMELESS:
-            painter.drawPixmap(self.rect(), self.pixmap)
+            self.draw_scaled_pixmap(painter, self.rect())
         else:
             img_size = self.image_size_at_zoom()
             target = QRect(self.offset, img_size)
-            painter.drawPixmap(target, self.pixmap)
+            self.draw_scaled_pixmap(painter, target)
 
     def closeEvent(self, event):  # noqa: N802 - Qt naming
         self.main_window.save_image_viewer_position(self.pos())
@@ -1857,6 +1965,26 @@ class MainWindow(QMainWindow):
         self.warned_invalid_image_folder_files: set[str] = set()
         self.current_font_size = max(9, min(25, safe_int(self.db.get_setting("font_size", "10"), 10)))
         self.font_size_actions: dict[int, QAction] = {}
+        self.image_viewer_resize_method = normalize_image_viewer_resize_method(
+            self.db.get_setting("image_viewer_resize_method", DEFAULT_IMAGE_VIEWER_RESIZE_METHOD)
+        )
+        self.image_viewer_resize_method_actions: dict[str, QAction] = {}
+        self.resident_mode = self.db.get_setting("resident_mode", "0") == "1"
+        self.resident_mode_action: Optional[QAction] = None
+        self.global_hotkey_enabled = self.db.get_setting(GLOBAL_HOTKEY_SETTING_KEY, "0") == "1"
+        self.global_hotkey_action: Optional[QAction] = None
+        self._global_hotkey_registered = False
+        self._global_hotkey_backend = ""
+        self._global_hotkey_hook_handle = None
+        self._global_hotkey_hook_proc = None
+        self._global_hotkey_down = False
+        self.startup_action: Optional[QAction] = None
+        self._force_quit = False
+        self.tray_icon: Optional[QSystemTrayIcon] = None
+        self.tray_menu: Optional[QMenu] = None
+        self._tray_click_timer: Optional[QTimer] = None
+        self.ipc_server: Optional[QLocalServer] = None
+        self._ipc_sockets: list[QLocalSocket] = []
         self.image_viewers: list[ImageViewerWindow] = []
         self._viewer_open_offset = 0
         self.material_load_chunk_size = 60
@@ -1880,6 +2008,10 @@ class MainWindow(QMainWindow):
         self.apply_font_size(self.current_font_size, save=False)
         self.restore_ui_state()
         self.refresh_prompt_list()
+        self.setup_tray_icon()
+        self.update_quit_on_last_window_closed()
+        self.register_global_hotkey_if_needed()
+        self.setup_ipc_server()
         self.statusBar().showMessage(f"DB: {self.db_path}")
 
     def apply_window_icon(self) -> None:
@@ -2197,7 +2329,7 @@ class MainWindow(QMainWindow):
         open_assets_action.triggered.connect(self.open_assets_folder)
         backup_action.triggered.connect(self.run_manual_backup)
         open_backup_action.triggered.connect(self.open_backup_folder)
-        quit_action.triggered.connect(self.close)
+        quit_action.triggered.connect(self.request_quit_app)
         file_menu.addAction(open_assets_action)
         file_menu.addAction(open_backup_action)
         file_menu.addSeparator()
@@ -2231,8 +2363,6 @@ class MainWindow(QMainWindow):
         copy_prompt_action.triggered.connect(self.copy_prompt)
         copy_full_action = QAction("タイトル+プロンプトをコピー", self)
         copy_full_action.triggered.connect(self.copy_full_prompt)
-        tag_manage_action = QAction("タグ管理", self)
-        tag_manage_action.triggered.connect(self.open_tag_manager)
         edit_menu.addAction(save_action)
         edit_menu.addSeparator()
         edit_menu.addAction(new_action)
@@ -2243,11 +2373,33 @@ class MainWindow(QMainWindow):
         edit_menu.addSeparator()
         edit_menu.addAction(copy_prompt_action)
         edit_menu.addAction(copy_full_action)
-        edit_menu.addSeparator()
-        edit_menu.addAction(tag_manage_action)
 
-        view_menu = self.menuBar().addMenu("表示")
-        font_menu = view_menu.addMenu("文字サイズ")
+        settings_menu = self.menuBar().addMenu("設定")
+        self.resident_mode_action = QAction("常駐モード", self)
+        self.resident_mode_action.setCheckable(True)
+        self.resident_mode_action.setChecked(self.resident_mode)
+        self.resident_mode_action.triggered.connect(self.set_resident_mode)
+        settings_menu.addAction(self.resident_mode_action)
+        self.startup_action = QAction("Windowsスタートアップに登録", self)
+        self.startup_action.setCheckable(True)
+        self.startup_action.setChecked(is_windows_startup_registered())
+        self.startup_action.triggered.connect(self.set_windows_startup_enabled)
+        settings_menu.addAction(self.startup_action)
+
+        hotkey_menu = settings_menu.addMenu("グローバルホットキー")
+        self.global_hotkey_action = QAction("Shift + Alt + A で表示", self)
+        self.global_hotkey_action.setCheckable(True)
+        self.global_hotkey_action.setChecked(self.global_hotkey_enabled)
+        self.global_hotkey_action.triggered.connect(self.set_global_hotkey_enabled)
+        hotkey_menu.addAction(self.global_hotkey_action)
+        settings_menu.addSeparator()
+
+        tag_manage_action = QAction("タグ管理", self)
+        tag_manage_action.triggered.connect(self.open_tag_manager)
+        settings_menu.addAction(tag_manage_action)
+        settings_menu.addSeparator()
+
+        font_menu = settings_menu.addMenu("文字サイズ")
         font_group = QActionGroup(self)
         font_group.setExclusive(True)
         self.font_size_actions = {}
@@ -2259,10 +2411,350 @@ class MainWindow(QMainWindow):
             font_menu.addAction(action)
             self.font_size_actions[size] = action
 
+        viewer_menu = settings_menu.addMenu("画像ビュアー")
+        resize_menu = viewer_menu.addMenu("リサイズ方法")
+        resize_group = QActionGroup(self)
+        resize_group.setExclusive(True)
+        self.image_viewer_resize_method_actions = {}
+        for method, label in IMAGE_VIEWER_RESIZE_METHODS:
+            action = QAction(label, self)
+            action.setCheckable(True)
+            action.triggered.connect(lambda checked=False, m=method: self.set_image_viewer_resize_method(m, save=True))
+            resize_group.addAction(action)
+            resize_menu.addAction(action)
+            self.image_viewer_resize_method_actions[method] = action
+        self.set_image_viewer_resize_method(self.image_viewer_resize_method, save=False)
+
         help_menu = self.menuBar().addMenu("ヘルプ")
         about_action = QAction("バージョン情報", self)
         about_action.triggered.connect(self.show_about_dialog)
         help_menu.addAction(about_action)
+
+    def setup_tray_icon(self) -> None:
+        if self.tray_icon is not None:
+            return
+        icon = load_window_icon()
+        self.tray_menu = QMenu(self)
+
+        show_action = QAction("表示", self)
+        new_action = QAction("新規", self)
+        quit_action = QAction("終了", self)
+        show_action.triggered.connect(self.show_main_window)
+        new_action.triggered.connect(self.show_main_and_new_prompt)
+        quit_action.triggered.connect(self.request_quit_app)
+
+        self.tray_menu.addAction(show_action)
+        self.tray_menu.addAction(new_action)
+        self.tray_menu.addSeparator()
+        self.tray_menu.addAction(quit_action)
+
+        self._tray_click_timer = QTimer(self)
+        self._tray_click_timer.setSingleShot(True)
+        self._tray_click_timer.timeout.connect(self.popup_tray_menu)
+
+        self.tray_icon = QSystemTrayIcon(icon, self)
+        self.tray_icon.setToolTip(APP_NAME)
+        self.tray_icon.setContextMenu(self.tray_menu)
+        self.tray_icon.activated.connect(self.on_tray_activated)
+        self.update_tray_visibility()
+
+    def update_tray_visibility(self) -> None:
+        if self.tray_icon is None:
+            return
+        if self.resident_mode and QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray_icon.show()
+        else:
+            self.tray_icon.hide()
+
+    def update_quit_on_last_window_closed(self) -> None:
+        app = QApplication.instance()
+        if app is not None:
+            app.setQuitOnLastWindowClosed(not self.resident_mode)
+
+    def set_resident_mode(self, checked: bool) -> None:
+        self.resident_mode = bool(checked)
+        if self.resident_mode_action is not None and self.resident_mode_action.isChecked() != self.resident_mode:
+            self.resident_mode_action.setChecked(self.resident_mode)
+        self.db.set_setting("resident_mode", "1" if self.resident_mode else "0")
+        self.update_tray_visibility()
+        self.update_quit_on_last_window_closed()
+        message = "常駐モード: ON" if self.resident_mode else "常駐モード: OFF"
+        self.statusBar().showMessage(message)
+
+    def set_windows_startup_enabled(self, checked: bool) -> None:
+        if checked:
+            if register_windows_startup():
+                if self.startup_action is not None:
+                    self.startup_action.setChecked(True)
+                self.statusBar().showMessage("Windowsスタートアップに登録しました")
+            else:
+                if self.startup_action is not None:
+                    self.startup_action.setChecked(False)
+                QMessageBox.warning(self, "Windowsスタートアップ", "Windowsスタートアップに登録できませんでした。")
+        else:
+            if unregister_windows_startup():
+                if self.startup_action is not None:
+                    self.startup_action.setChecked(False)
+                self.statusBar().showMessage("Windowsスタートアップ登録を解除しました")
+            else:
+                if self.startup_action is not None:
+                    self.startup_action.setChecked(is_windows_startup_registered())
+                QMessageBox.warning(self, "Windowsスタートアップ", "Windowsスタートアップ登録を解除できませんでした。")
+
+    def set_global_hotkey_enabled(self, checked: bool) -> None:
+        enabled = bool(checked)
+        if enabled:
+            if self.register_global_hotkey():
+                self.global_hotkey_enabled = True
+                self.db.set_setting(GLOBAL_HOTKEY_SETTING_KEY, "1")
+                self.statusBar().showMessage("グローバルホットキー: Shift + Alt + A")
+            else:
+                self.global_hotkey_enabled = False
+                self.db.set_setting(GLOBAL_HOTKEY_SETTING_KEY, "0")
+                if self.global_hotkey_action is not None:
+                    self.global_hotkey_action.setChecked(False)
+                QMessageBox.warning(
+                    self,
+                    "グローバルホットキー",
+                    "Shift + Alt + A を登録できませんでした。\n他のアプリが使用している可能性があります。",
+                )
+        else:
+            self.unregister_global_hotkey()
+            self.global_hotkey_enabled = False
+            self.db.set_setting(GLOBAL_HOTKEY_SETTING_KEY, "0")
+            self.statusBar().showMessage("グローバルホットキー: OFF")
+
+    def register_global_hotkey_if_needed(self) -> None:
+        if self.global_hotkey_enabled:
+            if not self.register_global_hotkey():
+                self.global_hotkey_enabled = False
+                self.db.set_setting(GLOBAL_HOTKEY_SETTING_KEY, "0")
+                if self.global_hotkey_action is not None:
+                    self.global_hotkey_action.setChecked(False)
+
+    def register_global_hotkey(self) -> bool:
+        self.unregister_global_hotkey()
+        if not sys.platform.startswith("win"):
+            return False
+        if self.register_global_hotkey_by_winapi():
+            self._global_hotkey_registered = True
+            self._global_hotkey_backend = "registerhotkey"
+            return True
+        if self.register_global_hotkey_by_keyboard_hook():
+            self._global_hotkey_registered = True
+            self._global_hotkey_backend = "keyboardhook"
+            return True
+        self._global_hotkey_registered = False
+        self._global_hotkey_backend = ""
+        return False
+
+    def register_global_hotkey_by_winapi(self) -> bool:
+        try:
+            import ctypes
+
+            MOD_ALT = 0x0001
+            MOD_SHIFT = 0x0004
+            MOD_NOREPEAT = 0x4000
+            modifiers = MOD_ALT | MOD_SHIFT | MOD_NOREPEAT
+            hwnd = int(self.winId())
+            return bool(ctypes.windll.user32.RegisterHotKey(hwnd, GLOBAL_HOTKEY_ID, modifiers, ord("A")))
+        except Exception:
+            return False
+
+    def register_global_hotkey_by_keyboard_hook(self) -> bool:
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            WH_KEYBOARD_LL = 13
+            WM_KEYDOWN = 0x0100
+            WM_KEYUP = 0x0101
+            WM_SYSKEYDOWN = 0x0104
+            WM_SYSKEYUP = 0x0105
+            VK_A = 0x41
+            VK_SHIFT = 0x10
+            VK_MENU = 0x12
+
+            class KBDLLHOOKSTRUCT(ctypes.Structure):
+                _fields_ = [
+                    ("vkCode", wintypes.DWORD),
+                    ("scanCode", wintypes.DWORD),
+                    ("flags", wintypes.DWORD),
+                    ("time", wintypes.DWORD),
+                    ("dwExtraInfo", ctypes.c_size_t),
+                ]
+
+            HOOKPROC = ctypes.WINFUNCTYPE(wintypes.LPARAM, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+
+            def is_down(vk: int) -> bool:
+                return bool(user32.GetAsyncKeyState(vk) & 0x8000)
+
+            def callback(n_code, w_param, l_param):
+                try:
+                    if n_code == 0:
+                        info = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                        if int(info.vkCode) == VK_A:
+                            if int(w_param) in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                                if is_down(VK_SHIFT) and is_down(VK_MENU):
+                                    if not self._global_hotkey_down:
+                                        self._global_hotkey_down = True
+                                        QTimer.singleShot(0, self.toggle_main_window_from_hotkey)
+                            elif int(w_param) in (WM_KEYUP, WM_SYSKEYUP):
+                                self._global_hotkey_down = False
+                except Exception:
+                    pass
+                return user32.CallNextHookEx(self._global_hotkey_hook_handle, n_code, w_param, l_param)
+
+            self._global_hotkey_hook_proc = HOOKPROC(callback)
+            handle = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._global_hotkey_hook_proc, kernel32.GetModuleHandleW(None), 0)
+            self._global_hotkey_hook_handle = handle
+            return bool(handle)
+        except Exception:
+            self._global_hotkey_hook_handle = None
+            self._global_hotkey_hook_proc = None
+            return False
+
+    def unregister_global_hotkey(self) -> None:
+        if sys.platform.startswith("win"):
+            try:
+                import ctypes
+
+                if self._global_hotkey_backend == "registerhotkey":
+                    ctypes.windll.user32.UnregisterHotKey(int(self.winId()), GLOBAL_HOTKEY_ID)
+                if self._global_hotkey_hook_handle:
+                    ctypes.windll.user32.UnhookWindowsHookEx(self._global_hotkey_hook_handle)
+            except Exception:
+                pass
+        self._global_hotkey_registered = False
+        self._global_hotkey_backend = ""
+        self._global_hotkey_hook_handle = None
+        self._global_hotkey_hook_proc = None
+        self._global_hotkey_down = False
+
+    def nativeEvent(self, eventType, message):  # noqa: N802 - Qt naming
+        if sys.platform.startswith("win"):
+            try:
+                from ctypes import wintypes
+
+                msg = wintypes.MSG.from_address(int(message))
+                if msg.message == 0x0312 and int(msg.wParam) == GLOBAL_HOTKEY_ID:
+                    self.toggle_main_window_from_hotkey()
+                    return True, 0
+            except Exception:
+                pass
+        return super().nativeEvent(eventType, message)
+
+    def popup_tray_menu(self) -> None:
+        if self.tray_menu is not None:
+            self.tray_menu.popup(QCursor.pos())
+
+    def on_tray_activated(self, reason) -> None:
+        if reason == QSystemTrayIcon.DoubleClick:
+            if self._tray_click_timer is not None and self._tray_click_timer.isActive():
+                self._tray_click_timer.stop()
+            self.show_main_window()
+            return
+        if reason == QSystemTrayIcon.Trigger:
+            if self._tray_click_timer is not None and self._tray_click_timer.isActive():
+                self._tray_click_timer.stop()
+                self.show_main_window()
+                return
+            delay = QApplication.doubleClickInterval() if QApplication.instance() is not None else 500
+            if self._tray_click_timer is not None:
+                self._tray_click_timer.start(max(500, int(delay)))
+            else:
+                self.popup_tray_menu()
+
+    def show_main_window(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def toggle_main_window_from_hotkey(self) -> None:
+        if self.isVisible() and not self.isMinimized():
+            if self.resident_mode:
+                self.update_tray_visibility()
+                self.hide()
+            else:
+                self.showMinimized()
+            return
+        self.show_main_window()
+
+    def show_main_and_new_prompt(self) -> None:
+        self.show_main_window()
+        self.new_prompt()
+
+    def request_quit_app(self) -> None:
+        self._force_quit = True
+        app = QApplication.instance()
+        if app is not None:
+            app.setQuitOnLastWindowClosed(True)
+        self.close()
+
+    def setup_ipc_server(self) -> None:
+        if self.ipc_server is not None:
+            return
+        QLocalServer.removeServer(APP_IPC_SERVER_NAME)
+        self.ipc_server = QLocalServer(self)
+        self.ipc_server.newConnection.connect(self.handle_ipc_connection)
+        if not self.ipc_server.listen(APP_IPC_SERVER_NAME):
+            self.ipc_server = None
+
+    def handle_ipc_connection(self) -> None:
+        if self.ipc_server is None:
+            return
+        while self.ipc_server.hasPendingConnections():
+            socket = self.ipc_server.nextPendingConnection()
+            if socket is None:
+                continue
+            socket.setParent(self)
+            self._ipc_sockets.append(socket)
+            socket.readyRead.connect(lambda s=socket: self.read_ipc_socket(s))
+            socket.disconnected.connect(lambda s=socket: self.cleanup_ipc_socket(s))
+            QTimer.singleShot(0, lambda s=socket: self.read_ipc_socket(s))
+
+    def cleanup_ipc_socket(self, socket: QLocalSocket) -> None:
+        if socket in self._ipc_sockets:
+            self._ipc_sockets.remove(socket)
+        socket.deleteLater()
+
+    def read_ipc_socket(self, socket: QLocalSocket) -> None:
+        if socket.bytesAvailable() <= 0:
+            return
+        data = bytes(socket.readAll()).decode("utf-8", errors="replace")
+        for line in data.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                message = json.loads(line)
+            except Exception:
+                continue
+            self.handle_ipc_message(message)
+
+    def handle_ipc_message(self, message: dict) -> None:
+        command = str(message.get("command", ""))
+        if command == "show":
+            self.show_main_window()
+            return
+        if command == "open_images":
+            paths = [Path(str(p)) for p in message.get("paths", [])]
+            self.open_external_image_files(paths)
+
+    def open_external_image_files(self, paths: Iterable[Path]) -> None:
+        for path in paths:
+            self.open_external_image_file(path)
+
+    def open_external_image_file(self, path: Path) -> None:
+        path = Path(path)
+        if not path.exists() or not path.is_file():
+            return
+        if path.suffix.lower() not in SUPPORTED_IMAGE_EXTS:
+            return
+        self.open_image_viewer(path, external_image=True)
+
 
     def connect_signals(self) -> None:
         self.search_edit.textChanged.connect(self.refresh_prompt_list)
@@ -2329,6 +2821,18 @@ class MainWindow(QMainWindow):
 
     def on_font_size_changed(self, value: int) -> None:
         self.apply_font_size(value, save=True)
+
+    def set_image_viewer_resize_method(self, method: str, save: bool = True) -> None:
+        method = normalize_image_viewer_resize_method(method)
+        self.image_viewer_resize_method = method
+        for key, action in self.image_viewer_resize_method_actions.items():
+            action.setChecked(key == method)
+        if save:
+            self.db.set_setting("image_viewer_resize_method", method)
+            self.statusBar().showMessage(f"画像ビュアーのリサイズ方法: {image_viewer_resize_method_label(method)}")
+        for viewer in list(self.image_viewers):
+            viewer.clear_scaled_cache()
+            viewer.update()
 
     def restore_ui_state(self) -> None:
         geometry_json = self.db.get_setting("window_geometry", "")
@@ -2771,6 +3275,28 @@ class MainWindow(QMainWindow):
         )
         if files:
             self.add_images_from_paths([Path(f) for f in files])
+
+    def add_external_image_to_current_prompt(self, path: Path) -> None:
+        if self.current_prompt_id is None:
+            QMessageBox.information(self, "素材へ追加", "追加先のカードがありません。")
+            return
+        self.add_images_from_paths([path])
+
+    def add_external_image_to_new_prompt(self, path: Path) -> None:
+        path = Path(path)
+        if not path.exists() or not path.is_file():
+            QMessageBox.warning(self, "素材へ追加エラー", "画像ファイルが見つかりません。")
+            return
+        if not self.maybe_save_dirty():
+            return
+        title = path.stem.strip() or "新規プロンプト"
+        new_id = self.db.create_prompt(title)
+        self.db.set_prompt_tags(new_id, [])
+        self.current_prompt_id = new_id
+        self.refresh_prompt_list()
+        self.select_prompt_in_list(new_id)
+        self.load_prompt(new_id)
+        self.add_images_from_paths([path])
 
     def add_images_from_paths(self, paths: Iterable[Path]) -> None:
         paths = [Path(p) for p in paths if Path(p).exists() and Path(p).is_file()]
@@ -3429,11 +3955,11 @@ class MainWindow(QMainWindow):
         else:
             open_path(path)
 
-    def open_image_viewer(self, path: Path) -> None:
+    def open_image_viewer(self, path: Path, external_image: bool = False) -> None:
         if not path.exists():
             QMessageBox.warning(self, "画像表示エラー", "画像ファイルが見つかりません。")
             return
-        viewer = ImageViewerWindow(self, path, ImageViewerWindow.MODE_FRAMELESS)
+        viewer = ImageViewerWindow(self, path, ImageViewerWindow.MODE_FRAMELESS, external_image=external_image)
         self.image_viewers.append(viewer)
         viewer.show()
         viewer.activateWindow()
@@ -3443,11 +3969,12 @@ class MainWindow(QMainWindow):
         zoom_percent = old_viewer.zoom_percent
         offset = QPoint(old_viewer.offset)
         image_path = old_viewer.image_path
+        external_image = getattr(old_viewer, "external_image", False)
         if old_viewer in self.image_viewers:
             self.image_viewers.remove(old_viewer)
         old_viewer.close()
 
-        viewer = ImageViewerWindow(self, image_path, mode)
+        viewer = ImageViewerWindow(self, image_path, mode, external_image=external_image)
         viewer.zoom_percent = zoom_percent
         viewer.offset = offset
         if geometry.isValid():
@@ -3574,14 +4101,33 @@ class MainWindow(QMainWindow):
             super().dropEvent(event)
 
     def closeEvent(self, event):  # noqa: N802 - Qt naming
+        if self.resident_mode and not self._force_quit:
+            if not self.maybe_save_dirty():
+                event.ignore()
+                return
+            self.save_ui_state()
+            self.update_tray_visibility()
+            self.hide()
+            event.ignore()
+            return
+
         if not self.maybe_save_dirty():
+            self._force_quit = False
             event.ignore()
             return
         self.cancel_material_list_loading()
         self.close_all_image_viewers()
         self.save_ui_state()
+        self.unregister_global_hotkey()
+        if self.tray_icon is not None:
+            self.tray_icon.hide()
+        if self.ipc_server is not None:
+            self.ipc_server.close()
         self.db.close()
         event.accept()
+        app = QApplication.instance()
+        if app is not None:
+            QTimer.singleShot(0, app.quit)
 
 
 def normalize_tag(tag: str) -> str:
@@ -3975,6 +4521,21 @@ def elide_material_label(text: str, max_chars: int = 22) -> str:
     return text[:keep] + "…"
 
 
+def normalize_image_viewer_resize_method(method: str) -> str:
+    method = str(method or "").strip().lower()
+    if method in IMAGE_VIEWER_RESIZE_METHOD_KEYS:
+        return method
+    return DEFAULT_IMAGE_VIEWER_RESIZE_METHOD
+
+
+def image_viewer_resize_method_label(method: str) -> str:
+    method = normalize_image_viewer_resize_method(method)
+    for key, label in IMAGE_VIEWER_RESIZE_METHODS:
+        if key == method:
+            return label
+    return method
+
+
 def show_file_properties(path: Path) -> bool:
     path = path.resolve()
     if not path.exists():
@@ -4043,6 +4604,105 @@ def safe_int(value: str, default: int) -> int:
         return default
 
 
+def powershell_quote(value: str) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def windows_startup_shortcut_path() -> Optional[Path]:
+    if not sys.platform.startswith("win"):
+        return None
+    appdata = os.environ.get("APPDATA", "")
+    if not appdata:
+        return None
+    return Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup" / STARTUP_SHORTCUT_NAME
+
+
+def startup_target_and_args() -> tuple[Path, str, Path, str]:
+    base_dir = get_base_dir()
+    if getattr(sys, "frozen", False):
+        target = Path(sys.executable).resolve()
+        arguments = STARTUP_ARG
+    else:
+        target = Path(sys.executable).resolve()
+        script = Path(__file__).resolve()
+        arguments = f'"{script}" {STARTUP_ARG}'
+    icon_path = base_dir / EXE_ICON_RELATIVE[0] / EXE_ICON_RELATIVE[1] / EXE_ICON_RELATIVE[2]
+    icon_location = str(icon_path if icon_path.exists() else target)
+    return target, arguments, base_dir, icon_location
+
+
+def is_windows_startup_registered() -> bool:
+    path = windows_startup_shortcut_path()
+    return bool(path and path.exists())
+
+
+def register_windows_startup() -> bool:
+    shortcut = windows_startup_shortcut_path()
+    if shortcut is None:
+        return False
+    target, arguments, working_dir, icon_location = startup_target_and_args()
+    try:
+        shortcut.parent.mkdir(parents=True, exist_ok=True)
+        command = "; ".join(
+            [
+                "$w = New-Object -ComObject WScript.Shell",
+                f"$s = $w.CreateShortcut({powershell_quote(str(shortcut))})",
+                f"$s.TargetPath = {powershell_quote(str(target))}",
+                f"$s.Arguments = {powershell_quote(arguments)}",
+                f"$s.WorkingDirectory = {powershell_quote(str(working_dir))}",
+                f"$s.IconLocation = {powershell_quote(icon_location)}",
+                "$s.WindowStyle = 7",
+                "$s.Save()",
+            ]
+        )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return result.returncode == 0 and shortcut.exists()
+    except Exception:
+        return False
+
+
+def unregister_windows_startup() -> bool:
+    shortcut = windows_startup_shortcut_path()
+    if shortcut is None:
+        return False
+    try:
+        if shortcut.exists():
+            shortcut.unlink()
+        return not shortcut.exists()
+    except Exception:
+        return False
+
+
+def collect_startup_image_paths(args: Iterable[str]) -> list[Path]:
+    paths: list[Path] = []
+    for arg in args:
+        raw = str(arg or "").strip()
+        if not raw or raw.startswith("--"):
+            continue
+        path = Path(raw)
+        if path.exists() and path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_EXTS:
+            paths.append(path.resolve())
+    return paths
+
+
+def send_ipc_message(message: dict) -> bool:
+    socket = QLocalSocket()
+    socket.connectToServer(APP_IPC_SERVER_NAME)
+    if not socket.waitForConnected(1200):
+        return False
+    payload = (json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8")
+    socket.write(payload)
+    socket.flush()
+    ok = socket.waitForBytesWritten(1200)
+    socket.disconnectFromServer()
+    return bool(ok)
+
+
 def main() -> int:
     set_windows_app_user_model_id()
     app = QApplication(sys.argv)
@@ -4051,14 +4711,36 @@ def main() -> int:
     if not app_icon.isNull():
         app.setWindowIcon(app_icon)
 
+    startup_image_paths = collect_startup_image_paths(sys.argv[1:])
+    startup_launch = STARTUP_ARG in sys.argv[1:]
+
     lock = QLockFile(str(get_base_dir() / ".ai-prompt-organizer.lock"))
     lock.setStaleLockTime(0)
     if not lock.tryLock(100):
+        if startup_image_paths:
+            send_ipc_message({"command": "open_images", "paths": [str(p) for p in startup_image_paths]})
+            return 0
+        if startup_launch:
+            return 0
+        if send_ipc_message({"command": "show"}):
+            return 0
         QMessageBox.information(None, APP_NAME, "AI Prompt Organizer は既に起動しています。")
         return 0
 
     window = MainWindow()
-    window.show()
+    if startup_launch:
+        if window.resident_mode:
+            window.update_tray_visibility()
+            window.hide()
+        else:
+            window.showMinimized()
+    elif startup_image_paths and window.resident_mode:
+        window.update_tray_visibility()
+        window.hide()
+    else:
+        window.show()
+    if startup_image_paths:
+        QTimer.singleShot(0, lambda paths=startup_image_paths: window.open_external_image_files(paths))
     QTimer.singleShot(0, window.apply_window_icon)
     QTimer.singleShot(1000, window.apply_window_icon)
     result = app.exec()
