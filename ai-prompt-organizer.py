@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-AI Prompt Organizer v36
+AI Prompt Organizer v39
 
 AI生成用プロンプトを、タイトル・タグ・説明・画像付きで管理するローカルGUIツール。
 PySide6 + SQLite で動作します。
@@ -28,7 +28,7 @@ from typing import Callable, Iterable, Optional
 
 try:
     from PySide6.QtCore import QLockFile, QMimeData, QPoint, QRect, QSize, Qt, QTimer, QUrl, Signal
-    from PySide6.QtGui import QAction, QActionGroup, QColor, QDrag, QFont, QGuiApplication, QIcon, QKeySequence, QPainter, QPixmap, QPixmapCache
+    from PySide6.QtGui import QAction, QActionGroup, QColor, QDrag, QFont, QGuiApplication, QIcon, QImage, QKeySequence, QPainter, QPixmap, QPixmapCache
     from PySide6.QtWidgets import (
         QApplication,
         QAbstractItemView,
@@ -69,7 +69,7 @@ except Exception as exc:  # pragma: no cover - 実行環境向けメッセージ
 
 
 APP_NAME = "AI Prompt Organizer"
-APP_VERSION = "v1.12.1"
+APP_VERSION = "v1.13.1"
 APP_AUTHOR = "MF235"
 APP_CONTACT_X = "https://x.com/MF235XBR"
 APP_REPOSITORY = "https://github.com/mf235/ai-prompt-organizer"
@@ -87,6 +87,14 @@ AUDIO_EXTS = {".wav", ".mp3", ".ogg", ".flac", ".m4a"}
 TEXT_EXTS = {".txt", ".md", ".json", ".csv", ".yaml", ".yml", ".xml", ".html", ".css", ".js", ".py"}
 DOCUMENT_EXTS = {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx"}
 CODE_EXTS = {".py", ".js", ".ts", ".html", ".css", ".cpp", ".c", ".h", ".cs", ".java", ".rs", ".go"}
+IMAGE_VIEWER_RESIZE_METHODS = [
+    ("nearest", "Nearest（軽量）"),
+    ("smooth", "Smooth（標準）"),
+    ("bicubic", "Bicubic（高品質）"),
+    ("lanczos", "Lanczos（最高品質）"),
+]
+IMAGE_VIEWER_RESIZE_METHOD_KEYS = {key for key, _label in IMAGE_VIEWER_RESIZE_METHODS}
+DEFAULT_IMAGE_VIEWER_RESIZE_METHOD = "bicubic"
 
 
 DEFAULT_CATEGORY_COLORS = {
@@ -1077,6 +1085,13 @@ class ImageListWidget(QListWidget):
             drag.setHotSpot(QPoint(min(thumb.width() // 2, 32), min(thumb.height() // 2, 32)))
         drag.exec(Qt.CopyAction)
 
+    def keyPressEvent(self, event):  # noqa: N802 - Qt naming
+        if event.key() == Qt.Key_F2:
+            self.main_window.rename_selected_image()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def dragEnterEvent(self, event):  # noqa: N802 - Qt naming
         if has_media_urls(event.mimeData()):
             event.acceptProposedAction()
@@ -1125,6 +1140,8 @@ class ImageViewerWindow(QWidget):
         self._press_window_pos = QPoint(0, 0)
         self._press_geom = QRect()
         self._press_offset = QPoint(0, 0)
+        self._scaled_pixmap_cache: dict[tuple[str, int, int, int], QPixmap] = {}
+        self._scaled_pixmap_cache_order: list[tuple[str, int, int, int]] = []
         self.setFocusPolicy(Qt.StrongFocus)
         self.setMouseTracking(True)
         self.setMinimumSize(80, 60)
@@ -1132,6 +1149,10 @@ class ImageViewerWindow(QWidget):
         self.apply_mode(first=True)
         self.resize_to_zoom()
         self.move(self.main_window.next_viewer_position(self.size()))
+
+    def clear_scaled_cache(self) -> None:
+        self._scaled_pixmap_cache.clear()
+        self._scaled_pixmap_cache_order.clear()
 
     def apply_mode(self, first: bool = False) -> None:
         current_geometry = QRect(self.geometry())
@@ -1211,6 +1232,31 @@ class ImageViewerWindow(QWidget):
             y = min(0, max(self.height() - img_size.height(), y))
         self.offset = QPoint(x, y)
 
+    def set_zoom_percent(self, zoom_percent: int) -> None:
+        zoom_percent = max(10, min(2000, int(zoom_percent)))
+        if zoom_percent == self.zoom_percent:
+            return
+        old_zoom = max(1, self.zoom_percent)
+        if self.mode == self.MODE_SCROLL and not self.pixmap.isNull():
+            center_x = self.width() / 2.0
+            center_y = self.height() / 2.0
+            source_x = (center_x - self.offset.x()) * 100.0 / old_zoom
+            source_y = (center_y - self.offset.y()) * 100.0 / old_zoom
+            self.zoom_percent = zoom_percent
+            new_x = int(round(center_x - source_x * self.zoom_percent / 100.0))
+            new_y = int(round(center_y - source_y * self.zoom_percent / 100.0))
+            self.offset = QPoint(new_x, new_y)
+            self.center_image_if_needed()
+        elif self.mode == self.MODE_FRAMELESS:
+            old_center = self.frameGeometry().center()
+            self.zoom_percent = zoom_percent
+            self.resize_to_zoom(clamp_to_screen=False)
+            self.move(old_center - QPoint(self.frameGeometry().width() // 2, self.frameGeometry().height() // 2))
+        else:
+            self.zoom_percent = zoom_percent
+            self.center_image_if_needed()
+        self.update()
+
     def edge_at(self, pos: QPoint) -> str:
         if self.mode != self.MODE_FRAMELESS:
             return ""
@@ -1267,19 +1313,17 @@ class ImageViewerWindow(QWidget):
         super().keyPressEvent(event)
 
     def wheelEvent(self, event):  # noqa: N802 - Qt naming
-        if event.modifiers() & Qt.ControlModifier:
-            delta = event.angleDelta().y()
-            if delta == 0:
-                return
-            self.zoom_percent = max(10, min(500, self.zoom_percent + (10 if delta > 0 else -10)))
-            if self.mode == self.MODE_FRAMELESS:
-                self.resize_to_zoom(clamp_to_screen=False)
-            else:
-                self.center_image_if_needed()
-            self.update()
-            event.accept()
+        delta = event.angleDelta().y()
+        if delta == 0:
+            super().wheelEvent(event)
             return
-        super().wheelEvent(event)
+        steps = delta / 120.0
+        factor = 1.1 ** steps
+        new_zoom = int(round(self.zoom_percent * factor))
+        if new_zoom == self.zoom_percent:
+            new_zoom += 1 if delta > 0 else -1
+        self.set_zoom_percent(new_zoom)
+        event.accept()
 
     def mousePressEvent(self, event):  # noqa: N802 - Qt naming
         if event.button() == Qt.LeftButton:
@@ -1369,6 +1413,52 @@ class ImageViewerWindow(QWidget):
         self.center_image_if_needed()
         super().resizeEvent(event)
 
+    def scaled_pixmap_for_target(self, target_size: QSize, method: str) -> QPixmap:
+        width = max(1, target_size.width())
+        height = max(1, target_size.height())
+        cache_key = (method, int(self.pixmap.cacheKey()), width, height)
+        cached = self._scaled_pixmap_cache.get(cache_key)
+        if cached is not None and not cached.isNull():
+            return cached
+        pixmap = QPixmap()
+        try:
+            import cv2  # type: ignore
+            import numpy as np  # type: ignore
+
+            qimage = self.pixmap.toImage().convertToFormat(QImage.Format_RGBA8888)
+            source_width = qimage.width()
+            source_height = qimage.height()
+            source = np.frombuffer(qimage.bits(), dtype=np.uint8).reshape((source_height, source_width, 4))
+            interpolation = cv2.INTER_LANCZOS4 if method == "lanczos" else cv2.INTER_CUBIC
+            resized = cv2.resize(source, (width, height), interpolation=interpolation)
+            resized = np.ascontiguousarray(resized)
+            out_image = QImage(resized.data, width, height, width * 4, QImage.Format_RGBA8888).copy()
+            pixmap = QPixmap.fromImage(out_image)
+        except Exception:
+            pixmap = self.pixmap.scaled(target_size, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        if pixmap.isNull():
+            pixmap = self.pixmap.scaled(target_size, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        self._scaled_pixmap_cache[cache_key] = pixmap
+        self._scaled_pixmap_cache_order.append(cache_key)
+        while len(self._scaled_pixmap_cache_order) > 8:
+            old_key = self._scaled_pixmap_cache_order.pop(0)
+            self._scaled_pixmap_cache.pop(old_key, None)
+        return pixmap
+
+    def draw_scaled_pixmap(self, painter: QPainter, target: QRect) -> None:
+        if target.width() <= 0 or target.height() <= 0:
+            return
+        method = normalize_image_viewer_resize_method(self.main_window.image_viewer_resize_method)
+        if method == "nearest":
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, False)
+            painter.drawPixmap(target, self.pixmap)
+        elif method == "smooth":
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            painter.drawPixmap(target, self.pixmap)
+        else:
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, False)
+            painter.drawPixmap(target.topLeft(), self.scaled_pixmap_for_target(target.size(), method))
+
     def paintEvent(self, event):  # noqa: N802 - Qt naming
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor(20, 20, 20))
@@ -1377,11 +1467,11 @@ class ImageViewerWindow(QWidget):
             painter.drawText(self.rect(), Qt.AlignCenter, "画像を表示できません")
             return
         if self.mode == self.MODE_FRAMELESS:
-            painter.drawPixmap(self.rect(), self.pixmap)
+            self.draw_scaled_pixmap(painter, self.rect())
         else:
             img_size = self.image_size_at_zoom()
             target = QRect(self.offset, img_size)
-            painter.drawPixmap(target, self.pixmap)
+            self.draw_scaled_pixmap(painter, target)
 
     def closeEvent(self, event):  # noqa: N802 - Qt naming
         self.main_window.save_image_viewer_position(self.pos())
@@ -1857,6 +1947,10 @@ class MainWindow(QMainWindow):
         self.warned_invalid_image_folder_files: set[str] = set()
         self.current_font_size = max(9, min(25, safe_int(self.db.get_setting("font_size", "10"), 10)))
         self.font_size_actions: dict[int, QAction] = {}
+        self.image_viewer_resize_method = normalize_image_viewer_resize_method(
+            self.db.get_setting("image_viewer_resize_method", DEFAULT_IMAGE_VIEWER_RESIZE_METHOD)
+        )
+        self.image_viewer_resize_method_actions: dict[str, QAction] = {}
         self.image_viewers: list[ImageViewerWindow] = []
         self._viewer_open_offset = 0
         self.material_load_chunk_size = 60
@@ -2231,8 +2325,6 @@ class MainWindow(QMainWindow):
         copy_prompt_action.triggered.connect(self.copy_prompt)
         copy_full_action = QAction("タイトル+プロンプトをコピー", self)
         copy_full_action.triggered.connect(self.copy_full_prompt)
-        tag_manage_action = QAction("タグ管理", self)
-        tag_manage_action.triggered.connect(self.open_tag_manager)
         edit_menu.addAction(save_action)
         edit_menu.addSeparator()
         edit_menu.addAction(new_action)
@@ -2243,11 +2335,14 @@ class MainWindow(QMainWindow):
         edit_menu.addSeparator()
         edit_menu.addAction(copy_prompt_action)
         edit_menu.addAction(copy_full_action)
-        edit_menu.addSeparator()
-        edit_menu.addAction(tag_manage_action)
 
-        view_menu = self.menuBar().addMenu("表示")
-        font_menu = view_menu.addMenu("文字サイズ")
+        settings_menu = self.menuBar().addMenu("設定")
+        tag_manage_action = QAction("タグ管理", self)
+        tag_manage_action.triggered.connect(self.open_tag_manager)
+        settings_menu.addAction(tag_manage_action)
+        settings_menu.addSeparator()
+
+        font_menu = settings_menu.addMenu("文字サイズ")
         font_group = QActionGroup(self)
         font_group.setExclusive(True)
         self.font_size_actions = {}
@@ -2258,6 +2353,20 @@ class MainWindow(QMainWindow):
             font_group.addAction(action)
             font_menu.addAction(action)
             self.font_size_actions[size] = action
+
+        viewer_menu = settings_menu.addMenu("画像ビュアー")
+        resize_menu = viewer_menu.addMenu("リサイズ方法")
+        resize_group = QActionGroup(self)
+        resize_group.setExclusive(True)
+        self.image_viewer_resize_method_actions = {}
+        for method, label in IMAGE_VIEWER_RESIZE_METHODS:
+            action = QAction(label, self)
+            action.setCheckable(True)
+            action.triggered.connect(lambda checked=False, m=method: self.set_image_viewer_resize_method(m, save=True))
+            resize_group.addAction(action)
+            resize_menu.addAction(action)
+            self.image_viewer_resize_method_actions[method] = action
+        self.set_image_viewer_resize_method(self.image_viewer_resize_method, save=False)
 
         help_menu = self.menuBar().addMenu("ヘルプ")
         about_action = QAction("バージョン情報", self)
@@ -2329,6 +2438,18 @@ class MainWindow(QMainWindow):
 
     def on_font_size_changed(self, value: int) -> None:
         self.apply_font_size(value, save=True)
+
+    def set_image_viewer_resize_method(self, method: str, save: bool = True) -> None:
+        method = normalize_image_viewer_resize_method(method)
+        self.image_viewer_resize_method = method
+        for key, action in self.image_viewer_resize_method_actions.items():
+            action.setChecked(key == method)
+        if save:
+            self.db.set_setting("image_viewer_resize_method", method)
+            self.statusBar().showMessage(f"画像ビュアーのリサイズ方法: {image_viewer_resize_method_label(method)}")
+        for viewer in list(self.image_viewers):
+            viewer.clear_scaled_cache()
+            viewer.update()
 
     def restore_ui_state(self) -> None:
         geometry_json = self.db.get_setting("window_geometry", "")
@@ -3973,6 +4094,21 @@ def elide_material_label(text: str, max_chars: int = 22) -> str:
         return text
     keep = max(1, max_chars - 1)
     return text[:keep] + "…"
+
+
+def normalize_image_viewer_resize_method(method: str) -> str:
+    method = str(method or "").strip().lower()
+    if method in IMAGE_VIEWER_RESIZE_METHOD_KEYS:
+        return method
+    return DEFAULT_IMAGE_VIEWER_RESIZE_METHOD
+
+
+def image_viewer_resize_method_label(method: str) -> str:
+    method = normalize_image_viewer_resize_method(method)
+    for key, label in IMAGE_VIEWER_RESIZE_METHODS:
+        if key == method:
+            return label
+    return method
 
 
 def show_file_properties(path: Path) -> bool:
