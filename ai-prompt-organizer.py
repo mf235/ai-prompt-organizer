@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-AI Prompt Organizer v17
+AI Prompt Organizer v18
 
 AI生成用プロンプトを、タイトル・タグ・説明・画像付きで管理するローカルGUIツール。
 PySide6 + SQLite で動作します。
@@ -68,7 +68,7 @@ except Exception as exc:  # pragma: no cover - 実行環境向けメッセージ
 
 
 APP_NAME = "AI Prompt Organizer"
-APP_VERSION = "v1.4.0"
+APP_VERSION = "v1.5.0"
 APP_AUTHOR = "MF235"
 APP_CONTACT_X = "https://x.com/MF235XBR"
 APP_REPOSITORY = "https://github.com/mf235/ai-prompt-organizer"
@@ -1464,6 +1464,7 @@ class MainWindow(QMainWindow):
         self.tag_color_map: dict[str, str] = {}
         self.tag_presets: dict[str, list[str]] = {}
         self.collapsible_sections: list[CollapsibleGroupBox] = []
+        self.warned_invalid_image_folder_files: set[str] = set()
 
         self.setWindowTitle(APP_NAME)
         self.apply_window_icon()
@@ -1787,12 +1788,14 @@ class MainWindow(QMainWindow):
         self.cover_image_button = QPushButton("カバーにする")
         self.open_image_button = QPushButton("開く")
         self.open_prompt_assets_button = QPushButton("素材フォルダ")
+        self.reload_materials_button = QPushButton("再読み込み")
         img_btn_row.addWidget(self.add_images_button)
         img_btn_row.addWidget(self.rename_image_button)
         img_btn_row.addWidget(self.remove_image_button)
         img_btn_row.addWidget(self.cover_image_button)
         img_btn_row.addWidget(self.open_image_button)
         img_btn_row.addWidget(self.open_prompt_assets_button)
+        img_btn_row.addWidget(self.reload_materials_button)
         img_btn_row.addStretch(1)
         image_layout.addLayout(img_btn_row)
         self.image_list = ImageListWidget(self)
@@ -1879,6 +1882,7 @@ class MainWindow(QMainWindow):
         self.cover_image_button.clicked.connect(self.set_selected_image_as_cover)
         self.open_image_button.clicked.connect(self.open_selected_image)
         self.open_prompt_assets_button.clicked.connect(self.open_current_prompt_asset_folder)
+        self.reload_materials_button.clicked.connect(self.reload_current_materials)
         self.image_list.itemDoubleClicked.connect(lambda _item: self.open_selected_image())
         self.image_list.currentItemChanged.connect(self.on_material_selected)
 
@@ -2162,7 +2166,11 @@ class MainWindow(QMainWindow):
         self.prompt_edit.setPlainText(str(row["prompt"]))
         self.negative_edit.setPlainText(str(row["negative_prompt"]))
         self.description_edit.setPlainText(str(row["description"]))
-        self.refresh_images()
+        assets_changed = self.sync_current_prompt_assets()
+        self.refresh_images(sync_assets=False)
+        if assets_changed:
+            self.refresh_prompt_list()
+            self.select_prompt_in_list(prompt_id)
         self.loading = False
         self.dirty = False
         self.statusBar().showMessage(f"読み込み: {row['title']}")
@@ -2421,8 +2429,17 @@ class MainWindow(QMainWindow):
         thumb = pix.scaled(320, 240, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         thumb_dir = self.prompt_thumbs_dir(prompt_id)
         thumb_dir.mkdir(parents=True, exist_ok=True)
-        thumb_path = thumb_dir / f"thumb_{image_id:08d}.png"
-        if thumb.save(str(thumb_path), "PNG"):
+        thumb_path = thumb_dir / f"thumb_{image_id:08d}.jpg"
+        canvas = QPixmap(320, 240)
+        canvas.fill(QColor("#ffffff"))
+        painter = QPainter(canvas)
+        try:
+            x = max(0, (canvas.width() - thumb.width()) // 2)
+            y = max(0, (canvas.height() - thumb.height()) // 2)
+            painter.drawPixmap(x, y, thumb)
+        finally:
+            painter.end()
+        if canvas.save(str(thumb_path), "JPEG", 90):
             return thumb_path
         return None
 
@@ -2517,10 +2534,95 @@ class MainWindow(QMainWindow):
             return thumb_path
         return None
 
-    def refresh_images(self) -> None:
+    def sync_current_prompt_assets(self) -> bool:
+        if self.current_prompt_id is None:
+            return False
+        prompt_id = self.current_prompt_id
+        image_dir, file_dir, _thumb_dir = self.ensure_prompt_asset_dirs(prompt_id)
+        changed = False
+        recycle_targets: list[Path] = []
+        registered: set[str] = set()
+
+        for row in self.db.list_images(prompt_id):
+            image_id = int(row["id"])
+            file_path = Path(str(row["file_path"] or ""))
+            if not file_path.exists():
+                thumb_path = Path(str(row["thumbnail_path"] or ""))
+                if thumb_path.exists():
+                    recycle_targets.append(thumb_path)
+                self.db.delete_image(image_id)
+                changed = True
+                continue
+            registered.add(material_path_key(file_path))
+
+        if recycle_targets:
+            move_paths_to_recycle_bin(recycle_targets)
+
+        invalid_image_files: list[str] = []
+        for child in sorted(image_dir.iterdir(), key=lambda p: p.name.lower()) if image_dir.exists() else []:
+            if not child.is_file():
+                continue
+            if material_path_key(child) in registered:
+                continue
+            if child.suffix.lower() not in SUPPORTED_IMAGE_EXTS:
+                key = material_path_key(child)
+                if key not in self.warned_invalid_image_folder_files:
+                    self.warned_invalid_image_folder_files.add(key)
+                    invalid_image_files.append(child.name)
+                continue
+            try:
+                image_id = self.db.add_image(prompt_id, str(child), "", media_type="image", original_name=child.name)
+                thumb_path = self.create_thumbnail(child, image_id, prompt_id)
+                if thumb_path:
+                    self.db.update_image_thumbnail(image_id, str(thumb_path))
+                registered.add(material_path_key(child))
+                changed = True
+            except Exception:
+                pass
+
+        for child in sorted(file_dir.iterdir(), key=lambda p: p.name.lower()) if file_dir.exists() else []:
+            if not child.is_file():
+                continue
+            if material_path_key(child) in registered:
+                continue
+            try:
+                if child.suffix.lower() in SUPPORTED_VIDEO_EXTS:
+                    image_id = self.db.add_image(prompt_id, str(child), "", media_type="video", original_name=child.name)
+                    thumb_path = self.create_video_thumbnail(child, image_id, prompt_id)
+                    if not thumb_path:
+                        thumb_path = self.create_extension_thumbnail(child, image_id, prompt_id)
+                else:
+                    image_id = self.db.add_image(prompt_id, str(child), "", media_type=media_type_for_path(child), original_name=child.name)
+                    thumb_path = self.create_extension_thumbnail(child, image_id, prompt_id)
+                if thumb_path:
+                    self.db.update_image_thumbnail(image_id, str(thumb_path))
+                registered.add(material_path_key(child))
+                changed = True
+            except Exception:
+                pass
+
+        if invalid_image_files:
+            preview = "\n".join(f"- {name}" for name in invalid_image_files[:20])
+            if len(invalid_image_files) > 20:
+                preview += f"\n...他 {len(invalid_image_files) - 20} 件"
+            QMessageBox.warning(
+                self,
+                "素材同期警告",
+                "imagesフォルダに画像以外のファイルがあります。\n"
+                "このフォルダでは画像ファイルだけを登録します。\n\n" + preview,
+            )
+
+        return changed
+
+    def refresh_images(self, sync_assets: bool = True) -> None:
         self.image_list.clear()
         if self.current_prompt_id is None:
             return
+        if sync_assets:
+            assets_changed = self.sync_current_prompt_assets()
+            if assets_changed:
+                self.refresh_prompt_list()
+                self.select_prompt_in_list(self.current_prompt_id)
         for row in self.db.list_images(self.current_prompt_id):
             image_id = int(row["id"])
             file_path = str(row["file_path"])
@@ -2558,6 +2660,14 @@ class MainWindow(QMainWindow):
             return
         file_name = str(current.data(Qt.UserRole + 1) or current.text())
         self.drop_hint_label.setText(file_name)
+
+    def reload_current_materials(self) -> None:
+        if self.current_prompt_id is None:
+            return
+        self.refresh_images(sync_assets=True)
+        self.refresh_prompt_list()
+        self.select_prompt_in_list(self.current_prompt_id)
+        self.statusBar().showMessage("素材リストを再読み込みしました")
 
     def rename_selected_image(self) -> None:
         image_id = self.selected_image_id()
@@ -2884,6 +2994,13 @@ def set_windows_app_user_model_id() -> None:
     except Exception:
         pass
 
+
+
+def material_path_key(path: Path) -> str:
+    try:
+        return os.path.normcase(str(Path(path).resolve()))
+    except Exception:
+        return os.path.normcase(str(Path(path)))
 
 
 def is_relative_to_path(child: Path, parent: Path) -> bool:
