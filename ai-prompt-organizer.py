@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-AI Prompt Organizer v18
+AI Prompt Organizer v20
 
 AI生成用プロンプトを、タイトル・タグ・説明・画像付きで管理するローカルGUIツール。
 PySide6 + SQLite で動作します。
@@ -28,7 +28,7 @@ from typing import Callable, Iterable, Optional
 
 try:
     from PySide6.QtCore import QLockFile, QPoint, QRect, QSize, Qt, Signal, QTimer
-    from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QIcon, QKeySequence, QPainter, QPixmap
+    from PySide6.QtGui import QAction, QActionGroup, QColor, QFont, QGuiApplication, QIcon, QKeySequence, QPainter, QPixmap
     from PySide6.QtWidgets import (
         QApplication,
         QAbstractItemView,
@@ -47,6 +47,7 @@ try:
         QListWidget,
         QListWidgetItem,
         QMainWindow,
+        QMenu,
         QMessageBox,
         QPushButton,
         QScrollArea,
@@ -68,7 +69,7 @@ except Exception as exc:  # pragma: no cover - 実行環境向けメッセージ
 
 
 APP_NAME = "AI Prompt Organizer"
-APP_VERSION = "v1.5.0"
+APP_VERSION = "v1.6.0"
 APP_AUTHOR = "MF235"
 APP_CONTACT_X = "https://x.com/MF235XBR"
 APP_REPOSITORY = "https://github.com/mf235/ai-prompt-organizer"
@@ -347,6 +348,24 @@ class Database:
     def list_categories(self) -> list[sqlite3.Row]:
         return self.conn.execute("SELECT name, color FROM tag_categories ORDER BY name COLLATE NOCASE").fetchall()
 
+    def find_tag_by_name_nocase(self, name: str) -> sqlite3.Row | None:
+        name = normalize_tag(name)
+        if not name:
+            return None
+        return self.conn.execute(
+            "SELECT id, name FROM tags WHERE name = ? COLLATE NOCASE ORDER BY id LIMIT 1",
+            (name,),
+        ).fetchone()
+
+    def canonical_tag_name(self, name: str) -> str:
+        name = normalize_tag(name)
+        if not name:
+            return ""
+        row = self.find_tag_by_name_nocase(name)
+        if row:
+            return str(row["name"])
+        return name
+
     def ensure_tag(self, name: str, category: str = "custom", color: str = "") -> int:
         name = normalize_tag(name)
         if not name:
@@ -355,7 +374,7 @@ class Database:
         self.ensure_category(category, DEFAULT_CATEGORY_COLORS.get(category, "#777777"))
         color = normalize_hex_color(color)
         cur = self.conn.cursor()
-        row = cur.execute("SELECT id FROM tags WHERE name = ?", (name,)).fetchone()
+        row = self.find_tag_by_name_nocase(name)
         if row:
             return int(row["id"])
         cur.execute("INSERT INTO tags(name, category, color) VALUES(?, ?, ?)", (name, category, color))
@@ -371,7 +390,7 @@ class Database:
         self.ensure_category(category)
         cur = self.conn.cursor()
         if tag_id is None:
-            row = cur.execute("SELECT id FROM tags WHERE name = ?", (name,)).fetchone()
+            row = self.find_tag_by_name_nocase(name)
             if row:
                 tag_id = int(row["id"])
                 cur.execute("UPDATE tags SET category = ?, color = ?, visible = ? WHERE id = ?", (category, color, visible_value, tag_id))
@@ -428,10 +447,11 @@ class Database:
         cur.execute("DELETE FROM prompt_tags WHERE prompt_id = ?", (prompt_id,))
         seen: set[str] = set()
         for tag_name in tag_names:
-            tag_name = normalize_tag(tag_name)
-            if not tag_name or tag_name in seen:
+            tag_name = self.canonical_tag_name(str(tag_name))
+            key = tag_name.casefold()
+            if not tag_name or key in seen:
                 continue
-            seen.add(tag_name)
+            seen.add(key)
             tag_id = self.ensure_tag(tag_name)
             cur.execute("INSERT OR IGNORE INTO prompt_tags(prompt_id, tag_id) VALUES(?, ?)", (prompt_id, tag_id))
         self.conn.commit()
@@ -655,7 +675,14 @@ class Database:
         name = name.strip()
         if not name:
             raise ValueError("プリセット名が空です。")
-        tag_list = list(dict.fromkeys(normalize_tag(t) for t in tags if normalize_tag(t)))
+        tag_list: list[str] = []
+        seen_tags: set[str] = set()
+        for tag in tags:
+            tag_name = self.canonical_tag_name(str(tag))
+            key = tag_name.casefold()
+            if tag_name and key not in seen_tags:
+                tag_list.append(tag_name)
+                seen_tags.add(key)
         for tag in tag_list:
             self.ensure_tag(tag)
         tags_json = json.dumps(tag_list, ensure_ascii=False)
@@ -836,9 +863,16 @@ class FlowLayout(QLayout):
 class TagChipEditor(QWidget):
     tagsChanged = Signal()
 
-    def __init__(self, color_provider: Callable[[str], str], parent: Optional[QWidget] = None, standalone_layout: bool = True):
+    def __init__(
+        self,
+        color_provider: Callable[[str], str],
+        parent: Optional[QWidget] = None,
+        standalone_layout: bool = True,
+        tag_resolver: Optional[Callable[[str], str]] = None,
+    ):
         super().__init__(parent)
         self.color_provider = color_provider
+        self.tag_resolver = tag_resolver
         self.tags: list[str] = []
 
         self.input_edit = QLineEdit()
@@ -863,12 +897,24 @@ class TagChipEditor(QWidget):
         self.input_edit.returnPressed.connect(self.add_from_input)
         self.add_button.clicked.connect(self.add_from_input)
 
+    def resolve_tag_name(self, tag: str) -> str:
+        tag = normalize_tag(tag)
+        if not tag:
+            return ""
+        if self.tag_resolver is None:
+            return tag
+        resolved = normalize_tag(self.tag_resolver(tag))
+        return resolved or tag
+
     def set_tags(self, tags: Iterable[str]) -> None:
         self.tags = []
+        seen: set[str] = set()
         for tag in tags:
-            tag = normalize_tag(tag)
-            if tag and tag not in self.tags:
+            tag = self.resolve_tag_name(str(tag))
+            key = tag.casefold()
+            if tag and key not in seen:
                 self.tags.append(tag)
+                seen.add(key)
         self.refresh_chips()
 
     def get_tags(self) -> list[str]:
@@ -876,10 +922,13 @@ class TagChipEditor(QWidget):
 
     def add_tags(self, tags: Iterable[str]) -> None:
         changed = False
+        seen = {tag.casefold() for tag in self.tags}
         for tag in tags:
-            tag = normalize_tag(tag)
-            if tag and tag not in self.tags:
+            tag = self.resolve_tag_name(str(tag))
+            key = tag.casefold()
+            if tag and key not in seen:
                 self.tags.append(tag)
+                seen.add(key)
                 changed = True
         if changed:
             self.refresh_chips()
@@ -1137,7 +1186,7 @@ class TagManagerDialog(QDialog):
         self.preset_name_edit = QLineEdit()
         preset_form.addWidget(self.preset_name_edit)
         preset_form.addWidget(QLabel("含めるタグ"))
-        self.preset_tags_editor = TagChipEditor(color_provider=self.color_provider)
+        self.preset_tags_editor = TagChipEditor(color_provider=self.color_provider, tag_resolver=self.db.canonical_tag_name)
         preset_form.addWidget(self.preset_tags_editor)
         preset_btn_row = QHBoxLayout()
         self.new_preset_button = QPushButton("新規")
@@ -1465,6 +1514,8 @@ class MainWindow(QMainWindow):
         self.tag_presets: dict[str, list[str]] = {}
         self.collapsible_sections: list[CollapsibleGroupBox] = []
         self.warned_invalid_image_folder_files: set[str] = set()
+        self.current_font_size = max(9, min(25, safe_int(self.db.get_setting("font_size", "10"), 10)))
+        self.font_size_actions: dict[int, QAction] = {}
 
         self.setWindowTitle(APP_NAME)
         self.apply_window_icon()
@@ -1476,7 +1527,7 @@ class MainWindow(QMainWindow):
         self.refresh_tags()
         self.reload_preset_combo()
         self.reload_meta_combos()
-        self.apply_font_size(self.font_size_spin.value(), save=False)
+        self.apply_font_size(self.current_font_size, save=False)
         self.restore_ui_state()
         self.refresh_prompt_list()
         self.statusBar().showMessage(f"DB: {self.db_path}")
@@ -1634,15 +1685,6 @@ class MainWindow(QMainWindow):
         self.search_edit.setClearButtonEnabled(True)
         left_layout.addWidget(self.search_edit)
 
-        quick_row = QHBoxLayout()
-        self.new_button = QPushButton("新規")
-        self.duplicate_button = QPushButton("複製")
-        self.delete_button = QPushButton("削除")
-        quick_row.addWidget(self.new_button)
-        quick_row.addWidget(self.duplicate_button)
-        quick_row.addWidget(self.delete_button)
-        left_layout.addLayout(quick_row)
-
         tag_box = QGroupBox("タグ絞り込み")
         tag_layout = QVBoxLayout(tag_box)
         tag_layout.setContentsMargins(8, 8, 8, 8)
@@ -1665,6 +1707,7 @@ class MainWindow(QMainWindow):
         self.prompt_list.setUniformItemSizes(False)
         self.prompt_list.setSpacing(4)
         self.prompt_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.prompt_list.setContextMenuPolicy(Qt.CustomContextMenu)
 
         self.left_splitter = QSplitter(Qt.Vertical)
         self.left_splitter.addWidget(tag_box)
@@ -1678,24 +1721,6 @@ class MainWindow(QMainWindow):
         self.right_widget = right
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(8, 0, 0, 0)
-
-        top_row = QHBoxLayout()
-        self.save_button = QPushButton("保存")
-        self.copy_prompt_button = QPushButton("プロンプトをコピー")
-        self.copy_full_button = QPushButton("タイトル+プロンプトをコピー")
-        self.manage_tags_button = QPushButton("タグ管理")
-        self.font_size_spin = QSpinBox()
-        self.font_size_spin.setRange(8, 28)
-        self.font_size_spin.setValue(safe_int(self.db.get_setting("font_size", "10"), 10))
-        self.font_size_spin.setSuffix(" pt")
-        top_row.addWidget(self.save_button)
-        top_row.addWidget(self.copy_prompt_button)
-        top_row.addWidget(self.copy_full_button)
-        top_row.addWidget(self.manage_tags_button)
-        top_row.addStretch(1)
-        top_row.addWidget(QLabel("文字サイズ"))
-        top_row.addWidget(self.font_size_spin)
-        right_layout.addLayout(top_row)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -1712,7 +1737,7 @@ class MainWindow(QMainWindow):
         self.engine_edit = self.create_editable_combo("例: ChatGPT / Gemini / Grok / Midjourney")
         self.model_edit = self.create_editable_combo("例: GPT-Image / Imagen / Flux など")
         self.project_edit = self.create_editable_combo("例: Layer Breaker / ちゃっぴー")
-        self.tags_editor = TagChipEditor(color_provider=self.tag_color_for_name, standalone_layout=False)
+        self.tags_editor = TagChipEditor(color_provider=self.tag_color_for_name, standalone_layout=False, tag_resolver=self.db.canonical_tag_name)
         self.preset_combo = QComboBox()
         self.preset_combo.addItem("タグプリセットを追加...")
         self.add_preset_button = QPushButton("追加")
@@ -1816,41 +1841,70 @@ class MainWindow(QMainWindow):
 
     def build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("ファイル")
-        new_action = QAction("新規", self)
-        new_action.setShortcut(QKeySequence.New)
         save_action = QAction("保存", self)
         save_action.setShortcut(QKeySequence.Save)
+        open_assets_action = QAction("素材フォルダを開く", self)
         backup_action = QAction("バックアップ実行", self)
+        open_backup_action = QAction("バックアップフォルダを開く", self)
         quit_action = QAction("終了", self)
         quit_action.setShortcut(QKeySequence.Quit)
-        new_action.triggered.connect(self.new_prompt)
         save_action.triggered.connect(self.save_current_prompt)
+        open_assets_action.triggered.connect(self.open_assets_folder)
         backup_action.triggered.connect(self.run_manual_backup)
+        open_backup_action.triggered.connect(self.open_backup_folder)
         quit_action.triggered.connect(self.close)
-        file_menu.addAction(new_action)
         file_menu.addAction(save_action)
+        file_menu.addSeparator()
+        file_menu.addAction(open_assets_action)
+        file_menu.addAction(open_backup_action)
+        file_menu.addSeparator()
         file_menu.addAction(backup_action)
         file_menu.addSeparator()
         file_menu.addAction(quit_action)
 
         edit_menu = self.menuBar().addMenu("編集")
+        new_action = QAction("新規", self)
+        new_action.setShortcut(QKeySequence.New)
+        new_action.triggered.connect(self.new_prompt)
+        duplicate_action = QAction("複製", self)
+        duplicate_action.triggered.connect(self.duplicate_prompt)
+        delete_action = QAction("削除", self)
+        delete_action.triggered.connect(self.delete_current_prompt)
+        search_action = QAction("検索", self)
+        search_action.setShortcut(QKeySequence.Find)
+        search_action.setShortcutContext(Qt.ApplicationShortcut)
+        search_action.triggered.connect(self.focus_search_box)
         copy_prompt_action = QAction("プロンプトをコピー", self)
         copy_prompt_action.setShortcut(QKeySequence("Alt+C"))
         copy_prompt_action.setShortcutContext(Qt.ApplicationShortcut)
         copy_prompt_action.triggered.connect(self.copy_prompt)
-        duplicate_action = QAction("複製", self)
-        duplicate_action.triggered.connect(self.duplicate_prompt)
+        copy_full_action = QAction("タイトル+プロンプトをコピー", self)
+        copy_full_action.triggered.connect(self.copy_full_prompt)
         tag_manage_action = QAction("タグ管理", self)
         tag_manage_action.triggered.connect(self.open_tag_manager)
-        edit_menu.addAction(copy_prompt_action)
+        edit_menu.addAction(new_action)
         edit_menu.addAction(duplicate_action)
+        edit_menu.addAction(delete_action)
+        edit_menu.addSeparator()
+        edit_menu.addAction(search_action)
+        edit_menu.addSeparator()
+        edit_menu.addAction(copy_prompt_action)
+        edit_menu.addAction(copy_full_action)
         edit_menu.addSeparator()
         edit_menu.addAction(tag_manage_action)
 
         view_menu = self.menuBar().addMenu("表示")
-        open_assets_action = QAction("素材フォルダを開く", self)
-        open_assets_action.triggered.connect(self.open_assets_folder)
-        view_menu.addAction(open_assets_action)
+        font_menu = view_menu.addMenu("文字サイズ")
+        font_group = QActionGroup(self)
+        font_group.setExclusive(True)
+        self.font_size_actions = {}
+        for size in range(9, 26):
+            action = QAction(f"{size}pt", self)
+            action.setCheckable(True)
+            action.triggered.connect(lambda checked=False, s=size: self.apply_font_size(s, save=True))
+            font_group.addAction(action)
+            font_menu.addAction(action)
+            self.font_size_actions[size] = action
 
         help_menu = self.menuBar().addMenu("ヘルプ")
         about_action = QAction("バージョン情報", self)
@@ -1861,19 +1915,12 @@ class MainWindow(QMainWindow):
         self.search_edit.textChanged.connect(self.refresh_prompt_list)
         self.prompt_list.currentItemChanged.connect(self.on_prompt_selected)
         self.prompt_list.itemDoubleClicked.connect(lambda _item: self.copy_prompt())
+        self.prompt_list.customContextMenuRequested.connect(self.show_prompt_list_context_menu)
         self.clear_tags_button.clicked.connect(self.clear_tag_filters)
         self.only_favorite_checkbox.stateChanged.connect(self.refresh_prompt_list)
-        self.font_size_spin.valueChanged.connect(self.on_font_size_changed)
         for section in self.collapsible_sections:
             section.collapsedChanged.connect(self.on_section_collapsed_changed)
 
-        self.new_button.clicked.connect(self.new_prompt)
-        self.save_button.clicked.connect(self.save_current_prompt)
-        self.duplicate_button.clicked.connect(self.duplicate_prompt)
-        self.delete_button.clicked.connect(self.delete_current_prompt)
-        self.copy_prompt_button.clicked.connect(self.copy_prompt)
-        self.copy_full_button.clicked.connect(self.copy_full_prompt)
-        self.manage_tags_button.clicked.connect(self.open_tag_manager)
         self.add_preset_button.clicked.connect(self.add_selected_preset)
 
         self.add_images_button.clicked.connect(self.choose_images)
@@ -1901,7 +1948,11 @@ class MainWindow(QMainWindow):
         self.description_edit.textChanged.connect(self.mark_dirty)
 
     def apply_font_size(self, size: int, save: bool = True) -> None:
-        size = max(8, min(28, int(size)))
+        size = max(9, min(25, int(size)))
+        self.current_font_size = size
+        action = self.font_size_actions.get(size)
+        if action is not None and not action.isChecked():
+            action.setChecked(True)
         app = QApplication.instance()
         if app is not None:
             font = app.font()
@@ -2103,10 +2154,19 @@ class MainWindow(QMainWindow):
             tag_name = str(button.property("tag_name") or "")
             button.setStyleSheet(chip_style(self.tag_color_for_name(tag_name), checked=False))
         self.tag_list_loading = False
+
+        self.only_favorite_checkbox.blockSignals(True)
+        self.only_favorite_checkbox.setChecked(False)
+        self.only_favorite_checkbox.blockSignals(False)
+
         if self.search_edit.text():
             self.search_edit.clear()
         else:
             self.refresh_prompt_list()
+
+    def focus_search_box(self) -> None:
+        self.search_edit.setFocus(Qt.ShortcutFocusReason)
+        self.search_edit.selectAll()
 
     def maybe_save_dirty(self) -> bool:
         if not self.dirty or self.current_prompt_id is None:
@@ -2237,6 +2297,30 @@ class MainWindow(QMainWindow):
         self.select_prompt_in_list(new_id)
         self.load_prompt(new_id)
         self.statusBar().showMessage("複製しました。素材はコピーせず、プロンプト情報だけ複製しています。")
+
+    def show_prompt_list_context_menu(self, pos: QPoint) -> None:
+        item = self.prompt_list.itemAt(pos)
+        if item is None:
+            return
+        target_id = int(item.data(Qt.UserRole))
+        self.prompt_list.setCurrentItem(item)
+        if self.current_prompt_id != target_id:
+            return
+        menu = QMenu(self)
+        copy_action = menu.addAction("プロンプトをコピー")
+        copy_full_action = menu.addAction("タイトル+プロンプトをコピー")
+        menu.addSeparator()
+        duplicate_action = menu.addAction("複製")
+        delete_action = menu.addAction("削除")
+        selected = menu.exec(self.prompt_list.viewport().mapToGlobal(pos))
+        if selected == copy_action:
+            self.copy_prompt()
+        elif selected == copy_full_action:
+            self.copy_full_prompt()
+        elif selected == duplicate_action:
+            self.duplicate_prompt()
+        elif selected == delete_action:
+            self.delete_current_prompt()
 
     def delete_current_prompt(self) -> None:
         if self.current_prompt_id is None:
@@ -2761,6 +2845,10 @@ class MainWindow(QMainWindow):
         if not row:
             return
         open_path(Path(str(row["file_path"])))
+
+    def open_backup_folder(self) -> None:
+        self.backup_dir.mkdir(parents=True, exist_ok=True)
+        open_path(self.backup_dir)
 
     def open_assets_folder(self) -> None:
         self.assets_dir.mkdir(parents=True, exist_ok=True)
