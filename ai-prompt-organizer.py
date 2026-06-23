@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-AI Prompt Organizer v25
+AI Prompt Organizer v29
 
 AI生成用プロンプトを、タイトル・タグ・説明・画像付きで管理するローカルGUIツール。
 PySide6 + SQLite で動作します。
@@ -27,8 +27,8 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 try:
-    from PySide6.QtCore import QLockFile, QPoint, QRect, QSize, Qt, Signal, QTimer
-    from PySide6.QtGui import QAction, QActionGroup, QColor, QFont, QGuiApplication, QIcon, QKeySequence, QPainter, QPixmap
+    from PySide6.QtCore import QLockFile, QMimeData, QPoint, QRect, QSize, Qt, QTimer, QUrl, Signal
+    from PySide6.QtGui import QAction, QActionGroup, QColor, QFont, QGuiApplication, QIcon, QKeySequence, QPainter, QPixmap, QPixmapCache
     from PySide6.QtWidgets import (
         QApplication,
         QAbstractItemView,
@@ -69,7 +69,7 @@ except Exception as exc:  # pragma: no cover - 実行環境向けメッセージ
 
 
 APP_NAME = "AI Prompt Organizer"
-APP_VERSION = "v1.8.0"
+APP_VERSION = "v1.10.0"
 APP_AUTHOR = "MF235"
 APP_CONTACT_X = "https://x.com/MF235XBR"
 APP_REPOSITORY = "https://github.com/mf235/ai-prompt-organizer"
@@ -1024,6 +1024,7 @@ class ImageListWidget(QListWidget):
         self.setSpacing(8)
         self.setWordWrap(False)
         self.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.setMinimumHeight(170)
 
     def dragEnterEvent(self, event):  # noqa: N802 - Qt naming
@@ -2104,15 +2105,13 @@ class MainWindow(QMainWindow):
         self.remove_image_button = QPushButton("選択素材を削除")
         self.cover_image_button = QPushButton("カバーにする")
         self.open_image_button = QPushButton("開く")
-        self.open_prompt_assets_button = QPushButton("素材フォルダ")
+        self.open_prompt_assets_button = QPushButton("素材フォルダを開く")
         self.reload_materials_button = QPushButton("再読み込み")
+        self.rebuild_thumbnails_button = QPushButton("サムネ再作成")
         img_btn_row.addWidget(self.add_images_button)
-        img_btn_row.addWidget(self.rename_image_button)
-        img_btn_row.addWidget(self.remove_image_button)
-        img_btn_row.addWidget(self.cover_image_button)
-        img_btn_row.addWidget(self.open_image_button)
         img_btn_row.addWidget(self.open_prompt_assets_button)
         img_btn_row.addWidget(self.reload_materials_button)
+        img_btn_row.addWidget(self.rebuild_thumbnails_button)
         img_btn_row.addStretch(1)
         image_layout.addLayout(img_btn_row)
         self.image_list = ImageListWidget(self)
@@ -2164,6 +2163,11 @@ class MainWindow(QMainWindow):
         search_action.setShortcut(QKeySequence.Find)
         search_action.setShortcutContext(Qt.ApplicationShortcut)
         search_action.triggered.connect(self.focus_search_box)
+        reload_action = QAction("再読み込み", self)
+        reload_action.setShortcut(QKeySequence("F5"))
+        reload_action.setShortcutContext(Qt.ApplicationShortcut)
+        reload_action.triggered.connect(self.reload_current_materials)
+        self.addAction(reload_action)
         copy_prompt_action = QAction("プロンプトをコピー", self)
         copy_prompt_action.setShortcut(QKeySequence("Alt+C"))
         copy_prompt_action.setShortcutContext(Qt.ApplicationShortcut)
@@ -2222,6 +2226,8 @@ class MainWindow(QMainWindow):
         self.open_image_button.clicked.connect(self.open_selected_image)
         self.open_prompt_assets_button.clicked.connect(self.open_current_prompt_asset_folder)
         self.reload_materials_button.clicked.connect(self.reload_current_materials)
+        self.rebuild_thumbnails_button.clicked.connect(self.rebuild_current_material_thumbnails)
+        self.image_list.customContextMenuRequested.connect(self.show_material_context_menu)
         self.image_list.itemDoubleClicked.connect(lambda _item: self.open_selected_image())
         self.image_list.currentItemChanged.connect(self.on_material_selected)
 
@@ -2728,7 +2734,7 @@ class MainWindow(QMainWindow):
                     if src.resolve() != dest.resolve():
                         shutil.copy2(src, dest)
                     image_id = self.db.add_image(self.current_prompt_id, str(dest), "", media_type="image", original_name=src.name)
-                    thumb_path = self.create_thumbnail(dest, image_id, self.current_prompt_id)
+                    thumb_path = self.create_material_thumbnail(dest, image_id, self.current_prompt_id, "image")
                     if thumb_path:
                         self.db.update_image_thumbnail(image_id, str(thumb_path))
                     added += 1
@@ -2747,15 +2753,15 @@ class MainWindow(QMainWindow):
                         if src.resolve() != dest.resolve():
                             shutil.copy2(src, dest)
                         image_id = self.db.add_image(self.current_prompt_id, str(dest), "", media_type="video", original_name=src.name)
-                        thumb_path = self.create_video_thumbnail(src, image_id, self.current_prompt_id)
+                        thumb_path = self.create_material_thumbnail(dest, image_id, self.current_prompt_id, "video")
                         if not thumb_path:
-                            thumb_path = self.create_extension_thumbnail(dest, image_id, self.current_prompt_id)
+                            thumb_path = self.create_material_thumbnail(dest, image_id, self.current_prompt_id, media_type_for_path(dest))
                         if thumb_path:
                             self.db.update_image_thumbnail(image_id, str(thumb_path))
                     else:
                         dest = self.generate_video_snapshot(src, prompt_image_dir)
                         image_id = self.db.add_image(self.current_prompt_id, str(dest), "", media_type="image", original_name=src.name)
-                        thumb_path = self.create_thumbnail(dest, image_id, self.current_prompt_id)
+                        thumb_path = self.create_material_thumbnail(dest, image_id, self.current_prompt_id, "image")
                         if thumb_path:
                             self.db.update_image_thumbnail(image_id, str(thumb_path))
                     added += 1
@@ -2765,7 +2771,7 @@ class MainWindow(QMainWindow):
                     if src.resolve() != dest.resolve():
                         shutil.copy2(src, dest)
                     image_id = self.db.add_image(self.current_prompt_id, str(dest), "", media_type=media_type_for_path(src), original_name=src.name)
-                    thumb_path = self.create_extension_thumbnail(src, image_id, self.current_prompt_id)
+                    thumb_path = self.create_material_thumbnail(dest, image_id, self.current_prompt_id, media_type_for_path(dest))
                     if thumb_path:
                         self.db.update_image_thumbnail(image_id, str(thumb_path))
                     added += 1
@@ -2798,6 +2804,17 @@ class MainWindow(QMainWindow):
             return "copy", apply_all
         return None, False
 
+    def create_material_thumbnail(self, src: Path, image_id: int, prompt_id: int, media_type: str = "") -> Optional[Path]:
+        media_type = (media_type or media_type_for_path(src)).strip().lower()
+        if media_type == "video" or src.suffix.lower() in SUPPORTED_VIDEO_EXTS:
+            thumb_path = self.create_video_thumbnail(src, image_id, prompt_id)
+            if thumb_path:
+                return thumb_path
+            return self.create_extension_thumbnail(src, image_id, prompt_id)
+        if media_type == "image" or src.suffix.lower() in SUPPORTED_IMAGE_EXTS:
+            return self.create_thumbnail(src, image_id, prompt_id)
+        return self.create_extension_thumbnail(src, image_id, prompt_id)
+
     def create_thumbnail(self, src: Path, image_id: int, prompt_id: int) -> Optional[Path]:
         pix = QPixmap(str(src))
         if pix.isNull():
@@ -2829,12 +2846,12 @@ class MainWindow(QMainWindow):
         thumb_dir.mkdir(parents=True, exist_ok=True)
         thumb_path = thumb_dir / f"thumb_{image_id:08d}.jpg"
         try:
-            self.write_video_frame_jpeg(src, thumb_path, target_height=360)
+            self.write_video_thumbnail_jpeg(src, thumb_path)
             return thumb_path
         except Exception:
             return None
 
-    def write_video_frame_jpeg(self, src: Path, dest: Path, target_height: int = 1080) -> None:
+    def capture_video_frame(self, src: Path):
         try:
             import cv2  # type: ignore
         except Exception as exc:
@@ -2868,20 +2885,53 @@ class MainWindow(QMainWindow):
 
             if frame is None:
                 raise RuntimeError("動画からフレームを取得できませんでした。")
-
-            height, width = frame.shape[:2]
-            if height <= 0 or width <= 0:
-                raise RuntimeError("取得したフレームのサイズが不正です。")
-
-            target_width = max(1, int(round(width * (target_height / float(height)))))
-            if height != target_height:
-                frame = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_AREA if target_height < height else cv2.INTER_CUBIC)
-
-            ok = cv2.imwrite(str(dest), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-            if not ok:
-                raise RuntimeError("JPEGを書き出せませんでした。")
+            return frame
         finally:
             cap.release()
+
+    def write_video_thumbnail_jpeg(self, src: Path, dest: Path) -> None:
+        try:
+            import cv2  # type: ignore
+        except Exception as exc:
+            raise RuntimeError("動画サムネ生成には opencv-python が必要です。") from exc
+
+        frame = self.capture_video_frame(src)
+        height, width = frame.shape[:2]
+        if height <= 0 or width <= 0:
+            raise RuntimeError("取得したフレームのサイズが不正です。")
+
+        canvas_w, canvas_h = 320, 240
+        scale = min(canvas_w / float(width), canvas_h / float(height))
+        target_w = max(1, int(round(width * scale)))
+        target_h = max(1, int(round(height * scale)))
+        resized = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC)
+        left = max(0, (canvas_w - target_w) // 2)
+        right = max(0, canvas_w - target_w - left)
+        top = max(0, (canvas_h - target_h) // 2)
+        bottom = max(0, canvas_h - target_h - top)
+        canvas = cv2.copyMakeBorder(resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(255, 255, 255))
+        ok = cv2.imwrite(str(dest), canvas, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+        if not ok:
+            raise RuntimeError("JPEGを書き出せませんでした。")
+
+    def write_video_frame_jpeg(self, src: Path, dest: Path, target_height: int = 1080) -> None:
+        try:
+            import cv2  # type: ignore
+        except Exception as exc:
+            raise RuntimeError("動画サムネ生成には opencv-python が必要です。") from exc
+
+        frame = self.capture_video_frame(src)
+        height, width = frame.shape[:2]
+        if height <= 0 or width <= 0:
+            raise RuntimeError("取得したフレームのサイズが不正です。")
+
+        target_width = max(1, int(round(width * (target_height / float(height)))))
+        if height != target_height:
+            frame = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_AREA if target_height < height else cv2.INTER_CUBIC)
+
+        ok = cv2.imwrite(str(dest), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+        if not ok:
+            raise RuntimeError("JPEGを書き出せませんでした。")
 
     def create_extension_thumbnail(self, src: Path, image_id: int, prompt_id: int) -> Optional[Path]:
         thumb_dir = self.prompt_thumbs_dir(prompt_id)
@@ -2930,6 +2980,16 @@ class MainWindow(QMainWindow):
                 changed = True
                 continue
             registered.add(material_path_key(file_path))
+            thumb_path = Path(str(row["thumbnail_path"] or ""))
+            if not thumb_path.exists():
+                media_type = str(row["media_type"] if "media_type" in row.keys() else media_type_for_path(file_path))
+                try:
+                    new_thumb = self.create_material_thumbnail(file_path, image_id, prompt_id, media_type)
+                    if new_thumb:
+                        self.db.update_image_thumbnail(image_id, str(new_thumb))
+                        changed = True
+                except Exception:
+                    pass
 
         if recycle_targets:
             move_paths_to_recycle_bin(recycle_targets)
@@ -2948,7 +3008,7 @@ class MainWindow(QMainWindow):
                 continue
             try:
                 image_id = self.db.add_image(prompt_id, str(child), "", media_type="image", original_name=child.name)
-                thumb_path = self.create_thumbnail(child, image_id, prompt_id)
+                thumb_path = self.create_material_thumbnail(child, image_id, prompt_id, "image")
                 if thumb_path:
                     self.db.update_image_thumbnail(image_id, str(thumb_path))
                 registered.add(material_path_key(child))
@@ -2964,12 +3024,12 @@ class MainWindow(QMainWindow):
             try:
                 if child.suffix.lower() in SUPPORTED_VIDEO_EXTS:
                     image_id = self.db.add_image(prompt_id, str(child), "", media_type="video", original_name=child.name)
-                    thumb_path = self.create_video_thumbnail(child, image_id, prompt_id)
+                    thumb_path = self.create_material_thumbnail(child, image_id, prompt_id, "video")
                     if not thumb_path:
-                        thumb_path = self.create_extension_thumbnail(child, image_id, prompt_id)
+                        thumb_path = self.create_material_thumbnail(child, image_id, prompt_id, media_type_for_path(child))
                 else:
                     image_id = self.db.add_image(prompt_id, str(child), "", media_type=media_type_for_path(child), original_name=child.name)
-                    thumb_path = self.create_extension_thumbnail(child, image_id, prompt_id)
+                    thumb_path = self.create_material_thumbnail(child, image_id, prompt_id, media_type_for_path(child))
                 if thumb_path:
                     self.db.update_image_thumbnail(image_id, str(thumb_path))
                 registered.add(material_path_key(child))
@@ -3044,6 +3104,47 @@ class MainWindow(QMainWindow):
         self.refresh_prompt_list()
         self.select_prompt_in_list(self.current_prompt_id)
         self.statusBar().showMessage("素材リストを再読み込みしました")
+
+    def rebuild_current_material_thumbnails(self) -> None:
+        if self.current_prompt_id is None:
+            return
+        prompt_id = self.current_prompt_id
+        self.sync_current_prompt_assets()
+        rows = self.db.list_images(prompt_id)
+        rebuilt = 0
+        errors: list[str] = []
+        old_thumbs_to_recycle: list[Path] = []
+        for row in rows:
+            image_id = int(row["id"])
+            file_path = Path(str(row["file_path"] or ""))
+            if not file_path.exists():
+                continue
+            old_thumb = Path(str(row["thumbnail_path"] or ""))
+            media_type = str(row["media_type"] if "media_type" in row.keys() else media_type_for_path(file_path))
+            try:
+                new_thumb = self.create_material_thumbnail(file_path, image_id, prompt_id, media_type)
+                if not new_thumb:
+                    raise RuntimeError("サムネを作成できませんでした。")
+                self.db.update_image_thumbnail(image_id, str(new_thumb))
+                if old_thumb.exists() and old_thumb.resolve() != new_thumb.resolve():
+                    old_thumbs_to_recycle.append(old_thumb)
+                rebuilt += 1
+            except Exception as exc:
+                errors.append(f"{file_path.name}: {exc}")
+
+        if old_thumbs_to_recycle:
+            move_paths_to_recycle_bin(old_thumbs_to_recycle)
+        QPixmapCache.clear()
+        self.refresh_images(sync_assets=False)
+        self.refresh_prompt_list()
+        self.select_prompt_in_list(prompt_id)
+        if errors:
+            QMessageBox.warning(
+                self,
+                "サムネ再作成警告",
+                f"サムネを {rebuilt} 件再作成しました。\n一部の素材で失敗しました。\n\n" + "\n".join(errors[:10]),
+            )
+        self.statusBar().showMessage(f"サムネを {rebuilt} 件再作成しました")
 
     def rename_selected_image(self) -> None:
         image_id = self.selected_image_id()
@@ -3128,6 +3229,64 @@ class MainWindow(QMainWindow):
         self.refresh_images()
         self.refresh_prompt_list()
         self.statusBar().showMessage("カバーを変更しました")
+
+    def copy_selected_material_to_clipboard(self) -> None:
+        image_id = self.selected_image_id()
+        if image_id is None:
+            return
+        row = self.db.get_image(image_id)
+        if not row:
+            return
+        path = Path(str(row["file_path"]))
+        if not path.exists():
+            QMessageBox.warning(self, "コピーエラー", "素材ファイルが見つかりません。")
+            return
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(str(path.resolve()))])
+        QApplication.clipboard().setMimeData(mime)
+        self.statusBar().showMessage(f"素材をクリップボードにコピーしました: {path.name}")
+
+    def show_selected_material_properties(self) -> None:
+        image_id = self.selected_image_id()
+        if image_id is None:
+            return
+        row = self.db.get_image(image_id)
+        if not row:
+            return
+        path = Path(str(row["file_path"]))
+        if not path.exists():
+            QMessageBox.warning(self, "プロパティ表示エラー", "素材ファイルが見つかりません。")
+            return
+        if not show_file_properties(path):
+            QMessageBox.warning(self, "プロパティ表示エラー", "プロパティを表示できませんでした。")
+
+    def show_material_context_menu(self, pos: QPoint) -> None:
+        item = self.image_list.itemAt(pos)
+        if item is None:
+            return
+        self.image_list.setCurrentItem(item)
+        menu = QMenu(self)
+        open_action = menu.addAction("開く")
+        copy_action = menu.addAction("コピー")
+        rename_action = menu.addAction("ファイル名の変更")
+        cover_action = menu.addAction("カバーにする")
+        menu.addSeparator()
+        delete_action = menu.addAction("削除")
+        menu.addSeparator()
+        property_action = menu.addAction("プロパティ")
+        selected = menu.exec(self.image_list.viewport().mapToGlobal(pos))
+        if selected == open_action:
+            self.open_selected_image()
+        elif selected == copy_action:
+            self.copy_selected_material_to_clipboard()
+        elif selected == rename_action:
+            self.rename_selected_image()
+        elif selected == cover_action:
+            self.set_selected_image_as_cover()
+        elif selected == delete_action:
+            self.remove_selected_image()
+        elif selected == property_action:
+            self.show_selected_material_properties()
 
     def open_selected_image(self) -> None:
         image_id = self.selected_image_id()
@@ -3683,6 +3842,54 @@ def elide_material_label(text: str, max_chars: int = 22) -> str:
         return text
     keep = max(1, max_chars - 1)
     return text[:keep] + "…"
+
+
+def show_file_properties(path: Path) -> bool:
+    path = path.resolve()
+    if not path.exists():
+        return False
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            SEE_MASK_INVOKEIDLIST = 0x0000000C
+            SW_SHOW = 5
+
+            class SHELLEXECUTEINFOW(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", wintypes.DWORD),
+                    ("fMask", wintypes.ULONG),
+                    ("hwnd", wintypes.HWND),
+                    ("lpVerb", wintypes.LPCWSTR),
+                    ("lpFile", wintypes.LPCWSTR),
+                    ("lpParameters", wintypes.LPCWSTR),
+                    ("lpDirectory", wintypes.LPCWSTR),
+                    ("nShow", ctypes.c_int),
+                    ("hInstApp", wintypes.HINSTANCE),
+                    ("lpIDList", wintypes.LPVOID),
+                    ("lpClass", wintypes.LPCWSTR),
+                    ("hkeyClass", wintypes.HKEY),
+                    ("dwHotKey", wintypes.DWORD),
+                    ("hIcon", wintypes.HANDLE),
+                    ("hProcess", wintypes.HANDLE),
+                ]
+
+            info = SHELLEXECUTEINFOW()
+            info.cbSize = ctypes.sizeof(SHELLEXECUTEINFOW)
+            info.fMask = SEE_MASK_INVOKEIDLIST
+            info.hwnd = None
+            info.lpVerb = "properties"
+            info.lpFile = str(path)
+            info.lpParameters = None
+            info.lpDirectory = str(path.parent)
+            info.nShow = SW_SHOW
+
+            return bool(ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(info)))
+        except Exception:
+            return False
+    open_path(path.parent)
+    return True
 
 
 def open_path(path: Path) -> None:
