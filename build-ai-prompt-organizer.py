@@ -9,7 +9,7 @@ import zipfile
 from pathlib import Path
 
 APP_NAME = "ai-prompt-organizer"
-APP_VERSION = "v1.20.1"
+APP_VERSION = "v1.20.2"
 ROOT_DIR = Path(__file__).resolve().parent
 SOURCE_SCRIPT = ROOT_DIR / f"{APP_NAME}.py"
 OUTPUT_DIR = ROOT_DIR / APP_NAME
@@ -30,6 +30,7 @@ LAUNCHER_ROOT_RES = ROOT_DIR / "apo-open.res"
 LAUNCHER_ROOT_RES_OBJ = ROOT_DIR / "apo-open-resource.o"
 LAUNCHER_GENERATED_ICON = DIST_DIR / "apo-open.ico"
 LAUNCHER_GENERATED_RESOURCE = DIST_DIR / "apo-open-generated.rc"
+RELEASE_TEXT_FILES = ["readme.txt", "LICENSE"]
 
 
 def log(message: str) -> None:
@@ -269,6 +270,17 @@ def build_launcher() -> None:
         log("[WARN] Launcher build failed. Release ZIP will continue without apo-open.exe.")
 
 
+def copy_release_text_files() -> None:
+    """Copy plain text files that should be bundled next to the EXE."""
+    for filename in RELEASE_TEXT_FILES:
+        source = ROOT_DIR / filename
+        if source.exists() and source.is_file():
+            shutil.copy2(source, OUTPUT_DIR / filename)
+            log(f"[INFO] Included {filename} in release ZIP.")
+        else:
+            log(f"[WARN] {filename} was not found. Release ZIP will continue without it.")
+
+
 def create_zip() -> None:
     exe_path = DIST_DIR / f"{APP_NAME}.exe"
     if not exe_path.exists():
@@ -279,6 +291,8 @@ def create_zip() -> None:
     launcher_exe = DIST_DIR / LAUNCHER_EXE_NAME
     if launcher_exe.exists():
         shutil.copy2(launcher_exe, OUTPUT_DIR / LAUNCHER_EXE_NAME)
+
+    copy_release_text_files()
 
     with zipfile.ZipFile(ZIP_PATH, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
         for file_path in sorted(OUTPUT_DIR.rglob("*")):
