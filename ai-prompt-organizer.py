@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-AI Prompt Organizer v69
+AI Prompt Organizer v73
 
 AI生成用プロンプトを、タイトル・タグ・説明・画像付きで管理するローカルGUIツール。
 PySide6 + SQLite で動作します。
@@ -74,7 +74,7 @@ except Exception as exc:  # pragma: no cover - 実行環境向けメッセージ
 
 
 APP_NAME = "AI Prompt Organizer"
-APP_VERSION = "v1.19.15"
+APP_VERSION = "v1.20.1"
 APP_AUTHOR = "MF235"
 APP_CONTACT_X = "https://x.com/MF235XBR"
 APP_REPOSITORY = "https://github.com/mf235/ai-prompt-organizer"
@@ -130,21 +130,18 @@ DEFAULT_CATEGORY_COLORS = {
 
 
 DEFAULT_TAG_CATEGORIES = {
-    "メディア": ["画像", "動画", "音楽", "テキスト", "ポーズ", "ロゴ", "UI"],
-    "用途": ["キャラ", "衣装", "表情", "背景", "構図", "カメラ", "ライティング", "画風", "ネガティブ", "動画モーション", "セリフ"],
-    "状態": ["お気に入り", "成功", "微妙", "要修正", "指が壊れる", "構図は良い", "色味は良い", "再利用可", "没"],
+    "メディア": ["テキスト", "動画", "画像", "音楽"],
+    "用途": ["README", "えっち", "アニメ", "カメラ", "キャラ", "セリフ", "ポーズ", "ロゴ", "体型", "動画モーション", "構図", "衣装", "表情", "質感"],
+    "プロジェクト": ["ちゃっぴー"],
     "AI": ["ChatGPT", "Gemini", "Grok", "Midjourney", "Stable Diffusion", "Flux", "Suno", "Kling", "Runway", "Google Flow"],
-    "プロジェクト": ["Layer Breaker", "ちゃっぴー", "Dark Chappy", "Stage背景", "BOSS", "年齢確認"],
 }
 
 
 DEFAULT_TAG_PRESETS = {
-    "画像生成基本": ["画像", "画風"],
+    "画像生成基本": ["画像"],
     "動画生成基本": ["動画", "動画モーション", "カメラ"],
     "ポーズ研究": ["画像", "ポーズ", "構図"],
     "キャラ設定": ["画像", "キャラ", "表情"],
-    "背景素材": ["画像", "背景", "ライティング"],
-    "Layer Breaker背景": ["画像", "Layer Breaker", "背景"],
     "ちゃっぴー": ["ちゃっぴー", "キャラ"],
 }
 
@@ -169,6 +166,7 @@ class PromptRow:
     project: str
     rating: int
     favorite: int
+    pinned: int
     tags: list[str]
     cover_thumb: str
     updated_at: str
@@ -197,6 +195,7 @@ class Database:
                 project TEXT NOT NULL DEFAULT '',
                 rating INTEGER NOT NULL DEFAULT 0,
                 favorite INTEGER NOT NULL DEFAULT 0,
+                pinned INTEGER NOT NULL DEFAULT 0,
                 parent_prompt_id INTEGER,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -204,6 +203,7 @@ class Database:
             )
             """
         )
+        self.ensure_column("prompts", "pinned", "INTEGER NOT NULL DEFAULT 0")
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS tag_categories (
@@ -499,16 +499,17 @@ class Database:
         project: str = "",
         rating: int = 0,
         favorite: int = 0,
+        pinned: int = 0,
         parent_prompt_id: Optional[int] = None,
     ) -> int:
         now = self.now()
         cur = self.conn.cursor()
         cur.execute(
             """
-            INSERT INTO prompts(title, prompt, negative_prompt, description, engine, model, project, rating, favorite, parent_prompt_id, created_at, updated_at)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO prompts(title, prompt, negative_prompt, description, engine, model, project, rating, favorite, pinned, parent_prompt_id, created_at, updated_at)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (title, prompt, negative_prompt, description, engine, model, project, rating, favorite, parent_prompt_id, now, now),
+            (title, prompt, negative_prompt, description, engine, model, project, rating, favorite, pinned, parent_prompt_id, now, now),
         )
         self.conn.commit()
         return int(cur.lastrowid)
@@ -535,6 +536,10 @@ class Database:
             WHERE id = ?
         """
         self.conn.execute(sql, values)
+        self.conn.commit()
+
+    def set_prompt_pinned(self, prompt_id: int, pinned: bool) -> None:
+        self.conn.execute("UPDATE prompts SET pinned = ? WHERE id = ?", (1 if pinned else 0, prompt_id))
         self.conn.commit()
 
     def delete_prompt(self, prompt_id: int) -> None:
@@ -607,6 +612,7 @@ class Database:
                     project=str(row["project"]),
                     rating=int(row["rating"]),
                     favorite=int(row["favorite"]),
+                    pinned=int(row["pinned"]),
                     tags=tags,
                     cover_thumb=str(row["cover_thumb"] or ""),
                     updated_at=str(row["updated_at"]),
@@ -706,6 +712,7 @@ class Database:
             project=str(row["project"]),
             rating=int(row["rating"]),
             favorite=int(row["favorite"]),
+            pinned=0,
             parent_prompt_id=prompt_id,
         )
         self.set_prompt_tags(new_id, self.list_prompt_tags(prompt_id))
@@ -808,19 +815,36 @@ class Database:
         old_value = normalize_meta_value(old_value or "")
         now = self.now()
         cur = self.conn.cursor()
-        if old_field and old_value and (old_field != field or old_value != value):
-            cur.execute("DELETE FROM meta_options WHERE field = ? AND value = ?", (old_field, old_value))
-            if old_field in META_OPTION_FIELDS:
-                cur.execute(f"UPDATE prompts SET {old_field} = ? WHERE {old_field} = ?", (value, old_value))
-        cur.execute(
-            """
-            INSERT INTO meta_options(field, value, created_at, updated_at)
-            VALUES(?, ?, ?, ?)
-            ON CONFLICT(field, value) DO UPDATE SET updated_at = excluded.updated_at
-            """,
-            (field, value, now, now),
-        )
-        self.conn.commit()
+        try:
+            if old_field and old_value and (old_field != field or old_value != value):
+                cur.execute("DELETE FROM meta_options WHERE field = ? AND value = ?", (old_field, old_value))
+                if old_field in META_OPTION_FIELDS and field in META_OPTION_FIELDS:
+                    if old_field == field:
+                        cur.execute(f"UPDATE prompts SET {old_field} = ? WHERE {old_field} = ?", (value, old_value))
+                    else:
+                        # 種類（列）を変更する場合は、旧列を空にして新列へ移す。
+                        # ただし移動先に既存値があるプロンプトは上書きしない。
+                        cur.execute(
+                            f"""
+                            UPDATE prompts
+                            SET {field} = CASE WHEN TRIM({field}) = '' THEN ? ELSE {field} END,
+                                {old_field} = ''
+                            WHERE {old_field} = ?
+                            """,
+                            (value, old_value),
+                        )
+            cur.execute(
+                """
+                INSERT INTO meta_options(field, value, created_at, updated_at)
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(field, value) DO UPDATE SET updated_at = excluded.updated_at
+                """,
+                (field, value, now, now),
+            )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
 
     def delete_meta_option(self, field: str, value: str) -> None:
         field = normalize_meta_field(field)
@@ -1245,8 +1269,13 @@ class ImageListWidget(QListWidget):
         mime = QMimeData()
         file_url = QUrl.fromLocalFile(str(path.resolve()))
         mime.setUrls([file_url])
-        # 外部ファイルD&DはURLだけを渡す。text/plainにフルパスを入れると、
-        # 同じアプリ内のテキスト欄へ誤ドロップした時にパス文字列が挿入される。
+        # Explorer等への通常ファイルD&D互換を優先する。
+        # Windows/QtではCF_HDROPがtext/uri-listと対応しているため、
+        # text/uri-listを削るとExplorerへのコピーまで壊れる環境がある。
+        # ChromeはFilesがあってもtext/plain/text/uri-listをテキスト欄へ流し込むことがあるため、
+        # text/plainには表示されないゼロ幅スペースだけを入れてURL/フルパスの誤挿入を避ける。
+        # 自アプリ内テキスト欄への誤ドロップはINTERNAL_MATERIAL_DRAG_MIMEをイベントフィルタで弾く。
+        mime.setText("\u200b")
         # 自分自身に戻ってきた場合にコピー登録されないよう識別子は残す。
         mime.setData(INTERNAL_MATERIAL_DRAG_MIME, str(image_id).encode("utf-8"))
         drag = QDrag(self)
@@ -1601,12 +1630,31 @@ class ImageViewerWindow(QWidget):
             max(1, int(round(self.pixmap.height() * self.zoom_percent / 100.0))),
         )
 
+    def available_rect(self) -> QRect:
+        return best_available_geometry_for_rect(self.frameGeometry())
+
     def available_size(self) -> QSize:
-        screen = QGuiApplication.screenAt(self.frameGeometry().center()) or QGuiApplication.primaryScreen()
-        if screen is None:
-            return QSize(1280, 720)
-        rect = screen.availableGeometry()
+        rect = self.available_rect()
         return QSize(max(120, rect.width()), max(90, rect.height()))
+
+    def frame_margins(self) -> tuple[int, int, int, int]:
+        if self.mode == self.MODE_FRAMELESS:
+            return (0, 0, 0, 0)
+        frame = self.frameGeometry()
+        geom = self.geometry()
+        if not frame.isValid() or not geom.isValid():
+            return (0, 0, 0, 0)
+        left = max(0, geom.left() - frame.left())
+        top = max(0, geom.top() - frame.top())
+        right = max(0, frame.right() - geom.right())
+        bottom = max(0, frame.bottom() - geom.bottom())
+        return (left, top, right, bottom)
+
+    def client_geometry_for_frame_rect(self, frame_rect: QRect) -> QRect:
+        left, top, right, bottom = self.frame_margins()
+        width = max(80, frame_rect.width() - left - right)
+        height = max(60, frame_rect.height() - top - bottom)
+        return QRect(frame_rect.x() + left, frame_rect.y() + top, width, height)
 
     def resize_to_zoom(self, clamp_to_screen: bool = True) -> None:
         desired = self.image_size_at_zoom()
@@ -1616,6 +1664,8 @@ class ImageViewerWindow(QWidget):
                 desired.scale(avail, Qt.KeepAspectRatio)
         if self.mode == self.MODE_FRAMELESS:
             self.resize(desired)
+            if clamp_to_screen:
+                self.setGeometry(keep_rect_on_available_screens(self.geometry(), 80, 60))
         self.center_image_if_needed()
 
     def center_image_if_needed(self) -> None:
@@ -1688,19 +1738,23 @@ class ImageViewerWindow(QWidget):
     def fit_to_screen_center(self) -> None:
         if self.pixmap.isNull():
             return
-        screen = QGuiApplication.screenAt(self.frameGeometry().center()) or QGuiApplication.primaryScreen()
-        available = screen.availableGeometry() if screen is not None else QRect(0, 0, 1280, 720)
-        desired = QSize(self.pixmap.width(), self.pixmap.height())
-        desired.scale(available.size(), Qt.KeepAspectRatio)
-        desired.setWidth(max(80, desired.width()))
-        desired.setHeight(max(60, desired.height()))
-        zoom_from_width = desired.width() * 100.0 / max(1, self.pixmap.width())
-        zoom_from_height = desired.height() * 100.0 / max(1, self.pixmap.height())
-        self.zoom_percent = max(10, min(2000, int(round(min(zoom_from_width, zoom_from_height)))))
-        rect = QRect(0, 0, desired.width(), desired.height())
-        rect.moveCenter(available.center())
-        self.setGeometry(rect)
-        self.offset = QPoint(0, 0)
+        available = self.available_rect()
+        if self.mode == self.MODE_SCROLL:
+            # 原寸スクロール表示では、画像ではなくウィンドウ外枠を作業領域へ合わせる。
+            # 通常ウィンドウはタイトルバー／枠があるため、クライアント領域をその分だけ内側に置く。
+            self.setGeometry(self.client_geometry_for_frame_rect(available))
+        else:
+            desired = QSize(self.pixmap.width(), self.pixmap.height())
+            desired.scale(available.size(), Qt.KeepAspectRatio)
+            desired.setWidth(max(80, desired.width()))
+            desired.setHeight(max(60, desired.height()))
+            zoom_from_width = desired.width() * 100.0 / max(1, self.pixmap.width())
+            zoom_from_height = desired.height() * 100.0 / max(1, self.pixmap.height())
+            self.zoom_percent = max(10, min(2000, int(round(min(zoom_from_width, zoom_from_height)))))
+            rect = QRect(0, 0, desired.width(), desired.height())
+            rect.moveCenter(available.center())
+            self.setGeometry(keep_rect_on_available_screens(rect, 80, 60))
+            self.offset = QPoint(0, 0)
         self.center_image_if_needed()
         self.update_cursor(QPoint(self.width() // 2, self.height() // 2))
         self.update()
@@ -1842,7 +1896,8 @@ class ImageViewerWindow(QWidget):
             new_x = geom.right() - new_w + 1
         if "T" in self._resize_edges:
             new_y = geom.bottom() - new_h + 1
-        self.setGeometry(new_x, new_y, new_w, new_h)
+        new_rect = keep_rect_on_available_screens(QRect(new_x, new_y, new_w, new_h), 80, 60)
+        self.setGeometry(new_rect)
         self.update()
 
     def resizeEvent(self, event):  # noqa: N802 - Qt naming
@@ -2484,6 +2539,7 @@ class MainWindow(QMainWindow):
         self.run_daily_backup_if_needed()
         self.migrate_legacy_asset_layout()
         self.current_prompt_id: Optional[int] = None
+        self._prompt_selection_syncing = False
         self.loading = False
         self.tag_list_loading = False
         self.dirty = False
@@ -2751,6 +2807,25 @@ class MainWindow(QMainWindow):
         tag_btn_row.addWidget(self.clear_tags_button)
         tag_btn_row.addWidget(self.only_favorite_checkbox)
         tag_layout.addLayout(tag_btn_row)
+        self.pinned_prompt_group = QGroupBox("ピン留め")
+        self.pinned_prompt_group.setStyleSheet(
+            "QGroupBox { background: #fff7df; border: 1px solid #e0c46a; border-radius: 4px; margin-top: 8px; } "
+            "QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; color: #6b5200; }"
+        )
+        pinned_layout = QVBoxLayout(self.pinned_prompt_group)
+        pinned_layout.setContentsMargins(6, 10, 6, 6)
+        self.pinned_prompt_list = QListWidget()
+        self.pinned_prompt_list.setIconSize(QSize(96, 72))
+        self.pinned_prompt_list.setUniformItemSizes(False)
+        self.pinned_prompt_list.setSpacing(4)
+        self.pinned_prompt_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.pinned_prompt_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.pinned_prompt_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.pinned_prompt_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.pinned_prompt_list.setStyleSheet("QListWidget { background: #fffaf0; border: 1px solid #eadb9f; }")
+        pinned_layout.addWidget(self.pinned_prompt_list)
+        self.pinned_prompt_group.setVisible(False)
+
         self.prompt_list = QListWidget()
         self.prompt_list.setIconSize(QSize(96, 72))
         self.prompt_list.setUniformItemSizes(False)
@@ -2760,8 +2835,9 @@ class MainWindow(QMainWindow):
 
         self.left_splitter = QSplitter(Qt.Vertical)
         self.left_splitter.addWidget(tag_box)
+        self.left_splitter.addWidget(self.pinned_prompt_group)
         self.left_splitter.addWidget(self.prompt_list)
-        self.left_splitter.setSizes([260, 540])
+        self.left_splitter.setSizes([260, 160, 540])
         left_layout.addWidget(self.left_splitter, 1)
 
         splitter.addWidget(left)
@@ -3336,7 +3412,10 @@ class MainWindow(QMainWindow):
         self.search_edit.textChanged.connect(self.refresh_prompt_list)
         self.prompt_list.currentItemChanged.connect(self.on_prompt_selected)
         self.prompt_list.itemDoubleClicked.connect(lambda _item: self.copy_prompt())
-        self.prompt_list.customContextMenuRequested.connect(self.show_prompt_list_context_menu)
+        self.prompt_list.customContextMenuRequested.connect(lambda pos: self.show_prompt_list_context_menu(pos, self.prompt_list))
+        self.pinned_prompt_list.currentItemChanged.connect(self.on_prompt_selected)
+        self.pinned_prompt_list.itemDoubleClicked.connect(lambda _item: self.copy_prompt())
+        self.pinned_prompt_list.customContextMenuRequested.connect(lambda pos: self.show_prompt_list_context_menu(pos, self.pinned_prompt_list))
         self.clear_tags_button.clicked.connect(self.clear_tag_filters)
         self.only_favorite_checkbox.stateChanged.connect(self.refresh_prompt_list)
         for section in self.collapsible_sections:
@@ -3419,7 +3498,8 @@ class MainWindow(QMainWindow):
                 y = safe_int(data.get("y", ""), self.y())
                 w = max(800, safe_int(data.get("w", ""), self.width()))
                 h = max(600, safe_int(data.get("h", ""), self.height()))
-                self.setGeometry(x, y, w, h)
+                rect = keep_rect_on_available_screens(QRect(x, y, w, h), 800, 600)
+                self.setGeometry(rect)
                 if bool(data.get("maximized", False)):
                     self.setWindowState(self.windowState() | Qt.WindowMaximized)
             except Exception:
@@ -3545,6 +3625,54 @@ class MainWindow(QMainWindow):
         if not self.tag_list_loading:
             self.refresh_prompt_list()
 
+    def prompt_row_matches_filters(self, row: PromptRow, query: str, selected_tags: set[str], only_fav: bool) -> bool:
+        if only_fav and not row.favorite:
+            return False
+        if selected_tags and not selected_tags.issubset(set(row.tags)):
+            return False
+        haystack = "\n".join(
+            [
+                row.title,
+                row.prompt,
+                row.negative_prompt,
+                row.description,
+                row.engine,
+                row.model,
+                row.project,
+                " ".join(row.tags),
+            ]
+        ).lower()
+        return not query or query in haystack
+
+    def add_prompt_row_to_list(self, target_list: QListWidget, row: PromptRow) -> None:
+        item = QListWidgetItem()
+        # The visible row is drawn by PromptListItemWidget.
+        # Keep the QListWidgetItem display text empty so Qt's default item text
+        # does not bleed into the reserved thumbnail area behind the custom widget.
+        item.setText("")
+        item.setData(Qt.UserRole, row.id)
+        item.setData(Qt.UserRole + 1, row.title or "(無題)")
+        item.setData(Qt.UserRole + 2, row.pinned)
+        item.setToolTip(f"更新: {row.updated_at}\nタグ: {', '.join(row.tags)}")
+        widget = PromptListItemWidget(row, QSize(72, 72))
+        item.setSizeHint(widget.sizeHint())
+        target_list.addItem(item)
+        target_list.setItemWidget(item, widget)
+
+    def update_pinned_prompt_area_height(self) -> None:
+        count = self.pinned_prompt_list.count()
+        if count <= 0:
+            self.pinned_prompt_group.setVisible(False)
+            return
+        self.pinned_prompt_group.setVisible(True)
+        row_height = 0
+        for index in range(count):
+            row_height += self.pinned_prompt_list.item(index).sizeHint().height()
+        list_height = row_height + max(0, count - 1) * self.pinned_prompt_list.spacing() + 10
+        group_height = list_height + 34
+        self.pinned_prompt_list.setFixedHeight(list_height)
+        self.pinned_prompt_group.setFixedHeight(group_height)
+
     def refresh_prompt_list(self) -> None:
         if self.loading:
             return
@@ -3555,45 +3683,43 @@ class MainWindow(QMainWindow):
         rows = self.db.list_prompts()
 
         self.prompt_list.blockSignals(True)
+        self.pinned_prompt_list.blockSignals(True)
         self.prompt_list.clear()
+        self.pinned_prompt_list.clear()
         matched_count = 0
+        pinned_count = 0
         for row in rows:
-            if only_fav and not row.favorite:
+            if row.pinned:
+                self.add_prompt_row_to_list(self.pinned_prompt_list, row)
+                pinned_count += 1
                 continue
-            if selected_tags and not selected_tags.issubset(set(row.tags)):
+            if not self.prompt_row_matches_filters(row, query, selected_tags, only_fav):
                 continue
-            haystack = "\n".join(
-                [
-                    row.title,
-                    row.prompt,
-                    row.negative_prompt,
-                    row.description,
-                    row.engine,
-                    row.model,
-                    row.project,
-                    " ".join(row.tags),
-                ]
-            ).lower()
-            if query and query not in haystack:
-                continue
-
-            item = QListWidgetItem()
-            # The visible row is drawn by PromptListItemWidget.
-            # Keep the QListWidgetItem display text empty so Qt's default item text
-            # does not bleed into the reserved thumbnail area behind the custom widget.
-            item.setText("")
-            item.setData(Qt.UserRole, row.id)
-            item.setData(Qt.UserRole + 1, row.title or "(無題)")
-            item.setToolTip(f"更新: {row.updated_at}\nタグ: {', '.join(row.tags)}")
-            widget = PromptListItemWidget(row, QSize(72, 72))
-            item.setSizeHint(widget.sizeHint())
-            self.prompt_list.addItem(item)
-            self.prompt_list.setItemWidget(item, widget)
-            if current_id == row.id:
-                self.prompt_list.setCurrentItem(item)
+            self.add_prompt_row_to_list(self.prompt_list, row)
             matched_count += 1
+
+        selected_item: QListWidgetItem | None = None
+        selected_list: QListWidget | None = None
+        if current_id is not None:
+            for target_list in (self.pinned_prompt_list, self.prompt_list):
+                for index in range(target_list.count()):
+                    item = target_list.item(index)
+                    if item is not None and int(item.data(Qt.UserRole)) == int(current_id):
+                        selected_item = item
+                        selected_list = target_list
+                        break
+                if selected_item is not None:
+                    break
+        if selected_item is not None and selected_list is not None:
+            selected_list.setCurrentItem(selected_item)
+
         self.prompt_list.blockSignals(False)
-        self.statusBar().showMessage(f"{matched_count} 件表示 / DB: {self.db_path}")
+        self.pinned_prompt_list.blockSignals(False)
+        self.update_pinned_prompt_area_height()
+        if pinned_count:
+            self.statusBar().showMessage(f"{matched_count} 件表示 / ピン留め {pinned_count} 件 / DB: {self.db_path}")
+        else:
+            self.statusBar().showMessage(f"{matched_count} 件表示 / DB: {self.db_path}")
 
     def clear_tag_filters(self) -> None:
         self.tag_list_loading = True
@@ -3633,10 +3759,21 @@ class MainWindow(QMainWindow):
         return True
 
     def on_prompt_selected(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
+        if self._prompt_selection_syncing:
+            return
         if current is None:
             return
-        if not self.maybe_save_dirty():
-            return
+        sender = self.sender()
+        other_list: QListWidget | None = None
+        if sender is self.pinned_prompt_list:
+            other_list = self.prompt_list
+        elif sender is self.prompt_list:
+            other_list = self.pinned_prompt_list
+        if other_list is not None:
+            other_list.blockSignals(True)
+            other_list.setCurrentItem(None)
+            other_list.clearSelection()
+            other_list.blockSignals(False)
         prompt_id = int(current.data(Qt.UserRole))
         self.load_prompt(prompt_id)
 
@@ -3714,11 +3851,21 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("保存しました")
 
     def select_prompt_in_list(self, prompt_id: int) -> None:
-        for i in range(self.prompt_list.count()):
-            item = self.prompt_list.item(i)
-            if int(item.data(Qt.UserRole)) == prompt_id:
-                self.prompt_list.setCurrentItem(item)
-                return
+        self._prompt_selection_syncing = True
+        try:
+            for target_list, other_list in ((self.pinned_prompt_list, self.prompt_list), (self.prompt_list, self.pinned_prompt_list)):
+                for i in range(target_list.count()):
+                    item = target_list.item(i)
+                    if int(item.data(Qt.UserRole)) == int(prompt_id):
+                        other_list.blockSignals(True)
+                        other_list.setCurrentItem(None)
+                        other_list.clearSelection()
+                        other_list.blockSignals(False)
+                        target_list.setCurrentItem(item)
+                        target_list.scrollToItem(item)
+                        return
+        finally:
+            self._prompt_selection_syncing = False
 
     def new_prompt(self) -> None:
         if not self.maybe_save_dirty():
@@ -3747,22 +3894,31 @@ class MainWindow(QMainWindow):
         self.load_prompt(new_id)
         self.statusBar().showMessage("複製しました。素材はコピーせず、プロンプト情報だけ複製しています。")
 
-    def show_prompt_list_context_menu(self, pos: QPoint) -> None:
-        item = self.prompt_list.itemAt(pos)
+    def show_prompt_list_context_menu(self, pos: QPoint, source_list: QListWidget | None = None) -> None:
+        source_list = source_list or self.prompt_list
+        item = source_list.itemAt(pos)
         if item is None:
             return
         target_id = int(item.data(Qt.UserRole))
-        self.prompt_list.setCurrentItem(item)
+        source_list.setCurrentItem(item)
         if self.current_prompt_id != target_id:
             return
+        row = self.db.get_prompt(target_id)
+        if row is None:
+            return
+        is_pinned = bool(row["pinned"])
         menu = QMenu(self)
+        pin_action = menu.addAction("ピン留め解除" if is_pinned else "ピン留め")
+        menu.addSeparator()
         copy_action = menu.addAction("プロンプトをコピー")
         copy_full_action = menu.addAction("タイトル+プロンプトをコピー")
         menu.addSeparator()
         duplicate_action = menu.addAction("複製")
         delete_action = menu.addAction("削除")
-        selected = menu.exec(self.prompt_list.viewport().mapToGlobal(pos))
-        if selected == copy_action:
+        selected = menu.exec(source_list.viewport().mapToGlobal(pos))
+        if selected == pin_action:
+            self.toggle_prompt_pinned(target_id, not is_pinned)
+        elif selected == copy_action:
             self.copy_prompt()
         elif selected == copy_full_action:
             self.copy_full_prompt()
@@ -3770,6 +3926,12 @@ class MainWindow(QMainWindow):
             self.duplicate_prompt()
         elif selected == delete_action:
             self.delete_current_prompt()
+
+    def toggle_prompt_pinned(self, prompt_id: int, pinned: bool) -> None:
+        self.db.set_prompt_pinned(prompt_id, pinned)
+        self.refresh_prompt_list()
+        self.select_prompt_in_list(prompt_id)
+        self.statusBar().showMessage("ピン留めしました" if pinned else "ピン留めを解除しました")
 
     def delete_current_prompt(self) -> None:
         if self.current_prompt_id is None:
@@ -4785,13 +4947,7 @@ class MainWindow(QMainWindow):
         self.db.set_setting("image_viewer_y", str(pos.y()))
 
     def keep_rect_on_screen(self, rect: QRect) -> QRect:
-        screen = QGuiApplication.screenAt(rect.center()) or QGuiApplication.primaryScreen()
-        available = screen.availableGeometry() if screen is not None else QRect(0, 0, 1280, 720)
-        width = min(max(80, rect.width()), available.width())
-        height = min(max(60, rect.height()), available.height())
-        x = min(max(available.x(), rect.x()), available.right() - width + 1)
-        y = min(max(available.y(), rect.y()), available.bottom() - height + 1)
-        return QRect(x, y, width, height)
+        return keep_rect_on_available_screens(rect, 80, 60)
 
     def next_viewer_position(self, size: QSize) -> QPoint:
         screen = QGuiApplication.primaryScreen()
@@ -4935,6 +5091,57 @@ def normalize_meta_value(value: str) -> str:
     value = str(value or "").strip()
     value = re.sub(r"\s+", " ", value)
     return value
+
+
+def available_screen_geometries() -> list[QRect]:
+    geometries: list[QRect] = []
+    for screen in QGuiApplication.screens():
+        if screen is not None:
+            geom = screen.availableGeometry()
+            if geom.isValid():
+                geometries.append(QRect(geom))
+    if not geometries:
+        screen = QGuiApplication.primaryScreen()
+        if screen is not None:
+            geom = screen.availableGeometry()
+            if geom.isValid():
+                geometries.append(QRect(geom))
+    return geometries or [QRect(0, 0, 1280, 720)]
+
+
+def best_available_geometry_for_rect(rect: QRect) -> QRect:
+    screen = QGuiApplication.screenAt(rect.center())
+    if screen is not None:
+        geom = screen.availableGeometry()
+        if geom.isValid():
+            return QRect(geom)
+    geometries = available_screen_geometries()
+    best = geometries[0]
+    best_area = -1
+    for geom in geometries:
+        inter = geom.intersected(rect)
+        area = inter.width() * inter.height() if inter.isValid() else 0
+        if area > best_area:
+            best = geom
+            best_area = area
+    return QRect(best)
+
+
+def keep_rect_on_available_screens(rect: QRect, min_width: int = 80, min_height: int = 60) -> QRect:
+    rect = QRect(rect)
+    available = best_available_geometry_for_rect(rect)
+    intersects_any = any(geom.intersects(rect) for geom in available_screen_geometries())
+    if not rect.isValid() or not intersects_any:
+        width = min(max(min_width, rect.width() if rect.isValid() else min_width), available.width())
+        height = min(max(min_height, rect.height() if rect.isValid() else min_height), available.height())
+        fixed = QRect(0, 0, width, height)
+        fixed.moveCenter(available.center())
+        return fixed
+    width = min(max(min_width, rect.width()), available.width())
+    height = min(max(min_height, rect.height()), available.height())
+    x = min(max(available.x(), rect.x()), available.right() - width + 1)
+    y = min(max(available.y(), rect.y()), available.bottom() - height + 1)
+    return QRect(x, y, width, height)
 
 
 def meta_field_label(field: str) -> str:
