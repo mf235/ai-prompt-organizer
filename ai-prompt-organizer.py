@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-AI Prompt Organizer v45
+AI Prompt Organizer v69
 
 AI生成用プロンプトを、タイトル・タグ・説明・画像付きで管理するローカルGUIツール。
 PySide6 + SQLite で動作します。
@@ -27,9 +27,9 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 try:
-    from PySide6.QtCore import QLockFile, QMimeData, QPoint, QRect, QSize, Qt, QTimer, QUrl, Signal
+    from PySide6.QtCore import QEvent, QLockFile, QMimeData, QPoint, QRect, QSize, Qt, QTimer, QUrl, Signal
     from PySide6.QtNetwork import QLocalServer, QLocalSocket
-    from PySide6.QtGui import QAction, QActionGroup, QColor, QCursor, QDrag, QFont, QGuiApplication, QIcon, QImage, QKeySequence, QPainter, QPixmap, QPixmapCache
+    from PySide6.QtGui import QAction, QActionGroup, QBrush, QColor, QCursor, QDrag, QFont, QGuiApplication, QIcon, QImage, QKeySequence, QPainter, QPixmap, QPixmapCache
     from PySide6.QtWidgets import (
         QApplication,
         QAbstractItemView,
@@ -56,6 +56,9 @@ try:
         QSplitter,
         QSpinBox,
         QStatusBar,
+        QStyle,
+        QStyledItemDelegate,
+        QStyleOptionViewItem,
         QSystemTrayIcon,
         QTabWidget,
         QTextEdit,
@@ -71,7 +74,7 @@ except Exception as exc:  # pragma: no cover - 実行環境向けメッセージ
 
 
 APP_NAME = "AI Prompt Organizer"
-APP_VERSION = "v1.16.3"
+APP_VERSION = "v1.19.15"
 APP_AUTHOR = "MF235"
 APP_CONTACT_X = "https://x.com/MF235XBR"
 APP_REPOSITORY = "https://github.com/mf235/ai-prompt-organizer"
@@ -102,6 +105,18 @@ IMAGE_VIEWER_RESIZE_METHODS = [
 ]
 IMAGE_VIEWER_RESIZE_METHOD_KEYS = {key for key, _label in IMAGE_VIEWER_RESIZE_METHODS}
 DEFAULT_IMAGE_VIEWER_RESIZE_METHOD = "bicubic"
+
+DEFAULT_MATERIAL_LABEL_COLORS = {
+    1: ("#ffffff", "#d32f2f"),
+    2: ("#ffffff", "#f57c00"),
+    3: ("#222222", "#fbc02d"),
+    4: ("#ffffff", "#388e3c"),
+    5: ("#ffffff", "#1976d2"),
+    6: ("#ffffff", "#7b1fa2"),
+    7: ("#ffffff", "#5d4037"),
+    8: ("#222222", "#cfd8dc"),
+    9: ("#ffffff", "#455a64"),
+}
 
 
 DEFAULT_CATEGORY_COLORS = {
@@ -236,6 +251,7 @@ class Database:
         )
         self.ensure_column("images", "media_type", "TEXT NOT NULL DEFAULT 'image'")
         self.ensure_column("images", "original_name", "TEXT NOT NULL DEFAULT ''")
+        self.ensure_column("images", "label_id", "INTEGER NOT NULL DEFAULT 0")
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS tag_presets (
@@ -631,11 +647,25 @@ class Database:
         self.conn.execute("UPDATE images SET file_path = ? WHERE id = ?", (file_path, image_id))
         self.conn.commit()
 
+    def update_image_label(self, image_id: int, label_id: int) -> None:
+        label_id = max(0, min(9, int(label_id)))
+        self.conn.execute("UPDATE images SET label_id = ? WHERE id = ?", (label_id, image_id))
+        self.conn.commit()
+
     def list_images(self, prompt_id: int) -> list[sqlite3.Row]:
         return self.conn.execute(
-            "SELECT * FROM images WHERE prompt_id = ? ORDER BY is_cover DESC, sort_order ASC, id ASC",
+            "SELECT * FROM images WHERE prompt_id = ? ORDER BY sort_order ASC, id ASC",
             (prompt_id,),
         ).fetchall()
+
+    def reorder_images(self, prompt_id: int, image_ids: list[int]) -> None:
+        cur = self.conn.cursor()
+        for sort_order, image_id in enumerate(image_ids):
+            cur.execute(
+                "UPDATE images SET sort_order = ? WHERE id = ? AND prompt_id = ?",
+                (sort_order, int(image_id), prompt_id),
+            )
+        self.conn.commit()
 
     def get_image(self, image_id: int) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM images WHERE id = ?", (image_id,)).fetchone()
@@ -1026,15 +1056,110 @@ class PromptListItemWidget(QWidget):
         layout.addLayout(text_layout, 1)
 
 
+
+class MaterialListItemDelegate(QStyledItemDelegate):
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index) -> None:
+        view = self.parent()
+        main_window = getattr(view, "main_window", None)
+        rect = option.rect.adjusted(3, 3, -3, -3)
+        selected = bool(option.state & QStyle.State_Selected)
+        hovered = bool(option.state & QStyle.State_MouseOver)
+        has_focus = bool(option.state & QStyle.State_HasFocus)
+
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
+        if selected:
+            painter.setPen(QColor("#0078d7"))
+            painter.setBrush(QColor(0, 120, 215, 34))
+            painter.drawRoundedRect(rect, 4, 4)
+        elif hovered:
+            painter.setPen(QColor("#8ab4f8"))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRoundedRect(rect, 4, 4)
+        elif has_focus:
+            painter.setPen(QColor("#0078d7"))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRoundedRect(rect, 4, 4)
+
+        icon = index.data(Qt.DecorationRole)
+        icon_size = QSize(140, 105)
+        icon_rect = QRect(
+            rect.left() + max(0, (rect.width() - icon_size.width()) // 2),
+            rect.top() + 8,
+            icon_size.width(),
+            icon_size.height(),
+        )
+        if isinstance(icon, QIcon) and not icon.isNull():
+            pix = icon.pixmap(icon_size)
+            if not pix.isNull():
+                x = icon_rect.left() + max(0, (icon_rect.width() - pix.width()) // 2)
+                y = icon_rect.top() + max(0, (icon_rect.height() - pix.height()) // 2)
+                painter.drawPixmap(x, y, pix)
+
+        label_id = safe_int(index.data(Qt.UserRole + 2), 0)
+        label_style = main_window.material_label_style(label_id) if main_window is not None else None
+        text = str(index.data(Qt.DisplayRole) or "")
+        label_rect = QRect(rect.left() + 4, rect.bottom() - 32, rect.width() - 8, 26)
+
+        if label_style:
+            fg, bg = label_style
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(bg))
+            painter.drawRoundedRect(label_rect, 3, 3)
+            text_color = QColor("#000000") if selected else QColor(fg)
+        elif selected:
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(210, 232, 255, 220))
+            painter.drawRoundedRect(label_rect, 3, 3)
+            text_color = QColor("#000000")
+        else:
+            text_color = option.palette.text().color()
+
+        font = QFont(option.font)
+        if selected:
+            font.setBold(True)
+        painter.setFont(font)
+        painter.setPen(text_color)
+        metrics = painter.fontMetrics()
+        elided = metrics.elidedText(text, Qt.ElideRight, max(10, label_rect.width() - 8))
+        painter.drawText(label_rect.adjusted(4, 0, -4, 0), Qt.AlignCenter, elided)
+        painter.restore()
+
+    def sizeHint(self, option: QStyleOptionViewItem, index) -> QSize:
+        return QSize(170, 150)
+
+
 class ImageListWidget(QListWidget):
     def __init__(self, main_window: "MainWindow"):
         super().__init__()
         self.main_window = main_window
         self._drag_start_pos: Optional[QPoint] = None
         self._drag_start_item: Optional[QListWidgetItem] = None
+        self._internal_reorder_done = False
+        self._external_drag_visual_timer: Optional[QTimer] = None
+        self._external_drag_override_cursor_active = False
+        self._drag_active_image_id: Optional[int] = None
+        self._drop_indicator_index: Optional[int] = None
+        self._drop_indicator_active = False
+        # D&D挿入ラインをアイテム境界の外側に自然に出すための左右共通余白。
+        # 左端だけを特別扱いしないため、素材一覧全体の仕様として余白を持つ。
+        self.drop_indicator_margin = 10
+        self._drop_indicator_widget = QWidget(self.viewport())
+        self._drop_indicator_widget.setFixedWidth(5)
+        self._drop_indicator_widget.setStyleSheet("background: #005fff; border-left: 1px solid #ffffff; border-right: 1px solid #ffffff;")
+        self._drop_indicator_widget.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._drop_indicator_widget.hide()
+        self.setObjectName("materialList")
+        self.setItemDelegate(MaterialListItemDelegate(self))
         self.setAcceptDrops(True)
-        self.setDragEnabled(True)
-        self.setDragDropMode(QAbstractItemView.DragDrop)
+        # Qt標準の内部ドラッグは、外部ファイルD&D用MIMEと競合して
+        # 禁止カーソルが出やすい。素材一覧内の並び替えは自前で追跡し、
+        # 一覧外へ出た時だけ外部アプリ向けQDragを開始する。
+        self.setDragEnabled(False)
+        self.setDragDropMode(QAbstractItemView.DropOnly)
+        self.setDragDropOverwriteMode(False)
+        self.setDropIndicatorShown(False)
         self.setDefaultDropAction(Qt.CopyAction)
         self.setViewMode(QListWidget.IconMode)
         self.setIconSize(QSize(140, 105))
@@ -1046,6 +1171,9 @@ class ImageListWidget(QListWidget):
         self.setSelectionMode(QAbstractItemView.SingleSelection)
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.setMinimumHeight(170)
+        self.setStyleSheet(
+            f"QListWidget#materialList {{ background: #ffffff; padding-left: {self.drop_indicator_margin}px; padding-right: {self.drop_indicator_margin}px; }}"
+        )
 
     def event_local_pos(self, event) -> QPoint:
         if hasattr(event, "position"):
@@ -1057,6 +1185,8 @@ class ImageListWidget(QListWidget):
             local_pos = self.event_local_pos(event)
             self._drag_start_pos = local_pos
             self._drag_start_item = self.itemAt(local_pos)
+            self._drag_active_image_id = None
+            self._internal_reorder_done = False
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):  # noqa: N802 - Qt naming
@@ -1066,52 +1196,314 @@ class ImageListWidget(QListWidget):
         if self._drag_start_pos is None or self._drag_start_item is None:
             super().mouseMoveEvent(event)
             return
+
+        local_pos = self.event_local_pos(event)
         drag_distance = QApplication.startDragDistance() if hasattr(QApplication, "startDragDistance") else QApplication.styleHints().startDragDistance()
-        if (self.event_local_pos(event) - self._drag_start_pos).manhattanLength() < drag_distance:
+        if (local_pos - self._drag_start_pos).manhattanLength() < drag_distance:
             super().mouseMoveEvent(event)
             return
-        self.setCurrentItem(self._drag_start_item)
-        self.startDrag(Qt.CopyAction)
-        self._drag_start_pos = None
-        self._drag_start_item = None
 
-    def startDrag(self, supported_actions):  # noqa: N802 - Qt naming
+        try:
+            image_id = int(self._drag_start_item.data(Qt.UserRole))
+        except Exception:
+            self.reset_manual_drag_state()
+            super().mouseMoveEvent(event)
+            return
+
+        self.setCurrentItem(self._drag_start_item)
+        self._drag_active_image_id = image_id
+
+        # 一覧内ではQDragを開始しない。OS/QtのD&Dカーソルではなく、
+        # 自前の挿入ラインだけで並び替え位置を示す。
+        if self.viewport().rect().contains(local_pos):
+            self.update_drop_indicator(local_pos)
+            event.accept()
+            return
+
+        # 一覧外へ出た場合だけ、外部アプリへ渡すファイルD&Dを開始する。
+        self.clear_drop_indicator()
+        self.start_external_file_drag(image_id)
+        self.reset_manual_drag_state()
+        event.accept()
+
+    def mouseReleaseEvent(self, event):  # noqa: N802 - Qt naming
+        if event.button() == Qt.LeftButton and self._drag_active_image_id is not None:
+            local_pos = self.event_local_pos(event)
+            image_id = self._drag_active_image_id
+            if self.viewport().rect().contains(local_pos):
+                self.main_window.reorder_material_by_drop(image_id, self.drop_insert_index(local_pos))
+                event.accept()
+            self.reset_manual_drag_state()
+            return
+        self.reset_manual_drag_state()
+        super().mouseReleaseEvent(event)
+
+    def start_external_file_drag(self, image_id: int) -> None:
         path = self.main_window.selected_material_path()
         if not path or not path.exists():
             return
         mime = QMimeData()
         file_url = QUrl.fromLocalFile(str(path.resolve()))
         mime.setUrls([file_url])
-        mime.setText(str(path.resolve()))
-        mime.setData(INTERNAL_MATERIAL_DRAG_MIME, b"1")
+        # 外部ファイルD&DはURLだけを渡す。text/plainにフルパスを入れると、
+        # 同じアプリ内のテキスト欄へ誤ドロップした時にパス文字列が挿入される。
+        # 自分自身に戻ってきた場合にコピー登録されないよう識別子は残す。
+        mime.setData(INTERNAL_MATERIAL_DRAG_MIME, str(image_id).encode("utf-8"))
         drag = QDrag(self)
         drag.setMimeData(mime)
         thumb = self.main_window.selected_material_drag_pixmap()
         if thumb is not None and not thumb.isNull():
             drag.setPixmap(thumb)
             drag.setHotSpot(QPoint(min(thumb.width() // 2, 32), min(thumb.height() // 2, 32)))
-        drag.exec(Qt.CopyAction)
+
+        # 同じ素材一覧へ戻った時にQt側がIgnoreAction扱いになっても、
+        # 実処理は受けられるので禁止カーソルだけを出しっぱなしにしない。
+        ignore_cursor = QPixmap(16, 16)
+        ignore_cursor.fill(QColor(0, 0, 0, 0))
+        drag.setDragCursor(ignore_cursor, Qt.IgnoreAction)
+
+        # 外部アプリへはファイルコピーとして渡す。
+        # 自分自身へ戻った場合も、transportとしてはCopyActionを受ける。
+        # 実際の素材一覧内処理はdropEvent側で内部MIMEを見て並び替える。
+        self._internal_reorder_done = False
+
+        # Windows/Qt環境によっては、URL付きの自分発QDragを同じ一覧へ戻した時に
+        # dragMoveEvent/dropEventが来ず、IgnoreActionの禁止カーソルだけが出ることがある。
+        # 実処理はexec後フォールバックで守りつつ、表示だけはカーソル位置を追って補う。
+        self.start_external_drag_visual_tracking(image_id)
+        result = Qt.IgnoreAction
+        try:
+            result = drag.exec(Qt.CopyAction, Qt.CopyAction)
+        finally:
+            self.stop_external_drag_visual_tracking()
+
+        # dropEventまで届かずIgnoreで終わった場合だけ、最終カーソル位置が素材一覧内なら
+        # 手動D&Dの続きとして並び替える。
+        if not self._internal_reorder_done and result == Qt.IgnoreAction:
+            local_pos = self.viewport().mapFromGlobal(QCursor.pos())
+            if self.viewport().rect().contains(local_pos):
+                self.main_window.reorder_material_by_drop(image_id, self.drop_insert_index(local_pos))
+
+    def start_external_drag_visual_tracking(self, image_id: int) -> None:
+        self.stop_external_drag_visual_tracking()
+        self._drag_active_image_id = image_id
+        self._external_drag_visual_timer = QTimer(self)
+        self._external_drag_visual_timer.setInterval(30)
+        self._external_drag_visual_timer.timeout.connect(lambda: self.update_external_drag_visuals(image_id))
+        self._external_drag_visual_timer.start()
+        self.update_external_drag_visuals(image_id)
+
+    def stop_external_drag_visual_tracking(self) -> None:
+        if self._external_drag_visual_timer is not None:
+            self._external_drag_visual_timer.stop()
+            self._external_drag_visual_timer.deleteLater()
+            self._external_drag_visual_timer = None
+        self.set_external_drag_override_cursor(False)
+        self.clear_drop_indicator()
+
+    def update_external_drag_visuals(self, image_id: int) -> None:
+        local_pos = self.viewport().mapFromGlobal(QCursor.pos())
+        if self.viewport().rect().contains(local_pos):
+            self._drag_active_image_id = image_id
+            self.update_drop_indicator(local_pos)
+            # QDrag側がIgnoreAction扱いでも、素材一覧内では実際に並び替え可能なので
+            # 禁止カーソルを出しっぱなしにしない。
+            self.set_external_drag_override_cursor(True)
+        else:
+            self.clear_drop_indicator()
+            self.set_external_drag_override_cursor(False)
+
+    def set_external_drag_override_cursor(self, enabled: bool) -> None:
+        if enabled and not self._external_drag_override_cursor_active:
+            QApplication.setOverrideCursor(QCursor(Qt.ArrowCursor))
+            self._external_drag_override_cursor_active = True
+        elif not enabled and self._external_drag_override_cursor_active:
+            QApplication.restoreOverrideCursor()
+            self._external_drag_override_cursor_active = False
+
+    def reset_manual_drag_state(self) -> None:
+        self.clear_drop_indicator()
+        self._drag_start_pos = None
+        self._drag_start_item = None
+        self._drag_active_image_id = None
+        self._internal_reorder_done = False
 
     def keyPressEvent(self, event):  # noqa: N802 - Qt naming
         if event.key() == Qt.Key_F2:
             self.main_window.rename_selected_image()
             event.accept()
             return
+        if event.modifiers() in (Qt.NoModifier, Qt.KeypadModifier):
+            key = event.key()
+            if Qt.Key_1 <= key <= Qt.Key_9:
+                self.main_window.set_selected_material_label(key - Qt.Key_0)
+                event.accept()
+                return
+            if key == Qt.Key_0:
+                self.main_window.set_selected_material_label(0)
+                event.accept()
+                return
         super().keyPressEvent(event)
 
+    def is_internal_material_drag(self, event) -> bool:
+        return event.source() is self or event.mimeData().hasFormat(INTERNAL_MATERIAL_DRAG_MIME)
+
+    def dragged_material_image_id(self, event) -> Optional[int]:
+        if self.is_internal_material_drag(event):
+            try:
+                return int(bytes(event.mimeData().data(INTERNAL_MATERIAL_DRAG_MIME)).decode("utf-8"))
+            except Exception:
+                pass
+        if self._drag_active_image_id is not None:
+            return self._drag_active_image_id
+        if self._drag_start_item is not None:
+            try:
+                return int(self._drag_start_item.data(Qt.UserRole))
+            except Exception:
+                pass
+        return None
+
     def dragEnterEvent(self, event):  # noqa: N802 - Qt naming
-        if has_media_urls(event.mimeData()):
+        if self.is_internal_material_drag(event):
+            local_pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            self.update_drop_indicator(local_pos)
+            # 一覧外へ出た時に開始する外部ファイル用QDragはCopyActionなので、
+            # 同じ素材一覧へ戻った時もtransportとしてはCopyActionで受ける。
+            # dropEvent内では内部MIMEを見て実際には並び替えだけを行う。
+            event.setDropAction(Qt.CopyAction)
+            event.accept()
+        elif has_media_urls(event.mimeData()):
+            self.clear_drop_indicator()
             event.acceptProposedAction()
         else:
+            self.clear_drop_indicator()
             super().dragEnterEvent(event)
 
     def dragMoveEvent(self, event):  # noqa: N802 - Qt naming
-        if has_media_urls(event.mimeData()):
+        if self.is_internal_material_drag(event):
+            local_pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            self.update_drop_indicator(local_pos)
+            event.setDropAction(Qt.CopyAction)
+            event.accept()
+        elif has_media_urls(event.mimeData()):
+            self.clear_drop_indicator()
             event.acceptProposedAction()
         else:
+            self.clear_drop_indicator()
             super().dragMoveEvent(event)
 
+    def dragLeaveEvent(self, event):  # noqa: N802 - Qt naming
+        self.clear_drop_indicator()
+        super().dragLeaveEvent(event)
+
+    def drop_indicator_geometry(self, index: int) -> QRect:
+        index = max(0, min(self.count(), int(index)))
+        indicator_width = max(5, self._drop_indicator_widget.width() or 5)
+        viewport_width = max(indicator_width + self.drop_indicator_margin * 2, self.viewport().width())
+        height = max(24, self.viewport().height() - 16)
+        edge_margin = max(0, int(self.drop_indicator_margin))
+        gap = max(4, self.spacing() // 2)
+
+        def clamped_x(raw_x: int) -> int:
+            # 左右に同じD&D用余白を持たせ、挿入ラインは常に表示領域内に収める。
+            return max(edge_margin, min(viewport_width - indicator_width - edge_margin, int(raw_x)))
+
+        if self.count() == 0:
+            return QRect(clamped_x(edge_margin), 8, indicator_width, height)
+        if index >= self.count():
+            rect = self.visualItemRect(self.item(self.count() - 1))
+            x = clamped_x(rect.right() + gap)
+            return QRect(x, rect.top() + 4, indicator_width, max(24, rect.height() - 8))
+        rect = self.visualItemRect(self.item(index))
+        x = clamped_x(rect.left() - gap)
+        return QRect(x, rect.top() + 4, indicator_width, max(24, rect.height() - 8))
+
+    def update_drop_indicator(self, pos: QPoint) -> None:
+        index = self.drop_insert_index(pos)
+        self._drop_indicator_index = index
+        self._drop_indicator_active = True
+        self._drop_indicator_widget.setGeometry(self.drop_indicator_geometry(index))
+        self._drop_indicator_widget.raise_()
+        self._drop_indicator_widget.show()
+        self.viewport().update()
+
+    def clear_drop_indicator(self) -> None:
+        self._drop_indicator_active = False
+        self._drop_indicator_index = None
+        self._drop_indicator_widget.hide()
+        self.viewport().update()
+
+    def drop_insert_index(self, pos: QPoint) -> int:
+        count = self.count()
+        if count <= 0:
+            return 0
+
+        entries: list[tuple[int, QRect]] = []
+        for index in range(count):
+            item = self.item(index)
+            if item is None:
+                continue
+            rect = self.visualItemRect(item)
+            if rect.isValid():
+                entries.append((index, rect))
+        if not entries:
+            return count
+
+        # アイコン表示では itemAt() だけに頼ると、先頭アイテムの左側などの余白が
+        # 「どのアイテムでもない場所」になり、末尾扱いになってしまう。
+        # そのため表示中アイテムの行と中心Xから、挿入位置を明示的に計算する。
+        spacing = max(1, self.spacing())
+        first_top = min(rect.top() for _index, rect in entries)
+        last_bottom = max(rect.bottom() for _index, rect in entries)
+        if pos.y() < first_top - spacing:
+            return entries[0][0]
+        if pos.y() > last_bottom + spacing:
+            return count
+
+        # 近い行を選ぶ。行内は左から右へ、中心より左ならそのアイテムの前、
+        # 中心より右なら次の位置へ挿入する。
+        rows: list[list[tuple[int, QRect]]] = []
+        for index, rect in sorted(entries, key=lambda e: (e[1].center().y(), e[1].center().x())):
+            placed = False
+            for row in rows:
+                row_center_y = sum(r.center().y() for _i, r in row) / max(1, len(row))
+                row_height = max(r.height() for _i, r in row)
+                if abs(rect.center().y() - row_center_y) <= max(spacing * 2, row_height * 0.45):
+                    row.append((index, rect))
+                    placed = True
+                    break
+            if not placed:
+                rows.append([(index, rect)])
+
+        def row_distance(row: list[tuple[int, QRect]]) -> float:
+            top = min(rect.top() for _index, rect in row)
+            bottom = max(rect.bottom() for _index, rect in row)
+            if top - spacing <= pos.y() <= bottom + spacing:
+                return 0.0
+            center_y = sum(rect.center().y() for _index, rect in row) / max(1, len(row))
+            return abs(pos.y() - center_y)
+
+        row = min(rows, key=row_distance)
+        row = sorted(row, key=lambda e: e[1].center().x())
+        for index, rect in row:
+            if pos.x() <= rect.center().x():
+                return max(0, min(count, index))
+        return max(0, min(count, row[-1][0] + 1))
+
     def dropEvent(self, event):  # noqa: N802 - Qt naming
+        if self.is_internal_material_drag(event):
+            image_id = self.dragged_material_image_id(event)
+            if image_id is None:
+                event.ignore()
+                return
+            local_pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            self._internal_reorder_done = True
+            self.clear_drop_indicator()
+            self.main_window.reorder_material_by_drop(image_id, self.drop_insert_index(local_pos))
+            event.setDropAction(Qt.CopyAction)
+            event.accept()
+            return
+        self.clear_drop_indicator()
         paths = media_paths_from_mime(event.mimeData())
         if paths:
             self.main_window.add_images_from_paths(paths)
@@ -1293,6 +1685,26 @@ class ImageViewerWindow(QWidget):
         else:
             self.setCursor(Qt.ArrowCursor)
 
+    def fit_to_screen_center(self) -> None:
+        if self.pixmap.isNull():
+            return
+        screen = QGuiApplication.screenAt(self.frameGeometry().center()) or QGuiApplication.primaryScreen()
+        available = screen.availableGeometry() if screen is not None else QRect(0, 0, 1280, 720)
+        desired = QSize(self.pixmap.width(), self.pixmap.height())
+        desired.scale(available.size(), Qt.KeepAspectRatio)
+        desired.setWidth(max(80, desired.width()))
+        desired.setHeight(max(60, desired.height()))
+        zoom_from_width = desired.width() * 100.0 / max(1, self.pixmap.width())
+        zoom_from_height = desired.height() * 100.0 / max(1, self.pixmap.height())
+        self.zoom_percent = max(10, min(2000, int(round(min(zoom_from_width, zoom_from_height)))))
+        rect = QRect(0, 0, desired.width(), desired.height())
+        rect.moveCenter(available.center())
+        self.setGeometry(rect)
+        self.offset = QPoint(0, 0)
+        self.center_image_if_needed()
+        self.update_cursor(QPoint(self.width() // 2, self.height() // 2))
+        self.update()
+
     def contextMenuEvent(self, event):  # noqa: N802 - Qt naming
         menu = QMenu(self)
         frameless_action = QAction(self.MODE_LABELS[self.MODE_FRAMELESS], self)
@@ -1342,6 +1754,17 @@ class ImageViewerWindow(QWidget):
             new_zoom += 1 if delta > 0 else -1
         self.set_zoom_percent(new_zoom)
         event.accept()
+
+    def mouseDoubleClickEvent(self, event):  # noqa: N802 - Qt naming
+        if event.button() == Qt.LeftButton:
+            self._dragging_window = False
+            self._dragging_image = False
+            self._resizing = False
+            self._resize_edges = ""
+            self.fit_to_screen_center()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
 
     def mousePressEvent(self, event):  # noqa: N802 - Qt naming
         if event.button() == Qt.LeftButton:
@@ -1939,6 +2362,112 @@ class TagManagerDialog(QDialog):
             line_edit.setText(color.name())
 
 
+
+class MaterialLabelManagerDialog(QDialog):
+    def __init__(self, db: Database, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.db = db
+        self.fg_edits: dict[int, QLineEdit] = {}
+        self.bg_edits: dict[int, QLineEdit] = {}
+        self.preview_labels: dict[int, QLabel] = {}
+        self.setWindowTitle("ラベル管理")
+        self.resize(620, 360)
+        self.build_ui()
+        self.load_values()
+
+    def build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.addWidget(QLabel("素材ラベル 1〜9 の文字色と背景色を設定します。"))
+
+        grid = QGridLayout()
+        grid.addWidget(QLabel("ラベル"), 0, 0)
+        grid.addWidget(QLabel("文字色"), 0, 1)
+        grid.addWidget(QLabel("背景色"), 0, 3)
+        grid.addWidget(QLabel("プレビュー"), 0, 5)
+
+        for label_id in range(1, 10):
+            fg_edit = QLineEdit()
+            bg_edit = QLineEdit()
+            fg_button = QPushButton("選択")
+            bg_button = QPushButton("選択")
+            preview = QLabel(f"ラベル {label_id}")
+            preview.setAlignment(Qt.AlignCenter)
+            preview.setMinimumWidth(120)
+
+            self.fg_edits[label_id] = fg_edit
+            self.bg_edits[label_id] = bg_edit
+            self.preview_labels[label_id] = preview
+
+            grid.addWidget(QLabel(str(label_id)), label_id, 0)
+            grid.addWidget(fg_edit, label_id, 1)
+            grid.addWidget(fg_button, label_id, 2)
+            grid.addWidget(bg_edit, label_id, 3)
+            grid.addWidget(bg_button, label_id, 4)
+            grid.addWidget(preview, label_id, 5)
+
+            fg_button.clicked.connect(lambda checked=False, i=label_id: self.pick_color(self.fg_edits[i]))
+            bg_button.clicked.connect(lambda checked=False, i=label_id: self.pick_color(self.bg_edits[i]))
+            fg_edit.textChanged.connect(lambda _text="", i=label_id: self.update_preview(i))
+            bg_edit.textChanged.connect(lambda _text="", i=label_id: self.update_preview(i))
+
+        root.addLayout(grid)
+
+        button_row = QHBoxLayout()
+        reset_button = QPushButton("初期値に戻す")
+        save_button = QPushButton("保存して閉じる")
+        close_button = QPushButton("閉じる")
+        reset_button.clicked.connect(self.reset_defaults)
+        save_button.clicked.connect(self.save_and_accept)
+        close_button.clicked.connect(self.reject)
+        button_row.addWidget(reset_button)
+        button_row.addStretch(1)
+        button_row.addWidget(save_button)
+        button_row.addWidget(close_button)
+        root.addLayout(button_row)
+
+    def setting_key(self, label_id: int, kind: str) -> str:
+        return f"material_label_{label_id}_{kind}"
+
+    def default_colors(self, label_id: int) -> tuple[str, str]:
+        return DEFAULT_MATERIAL_LABEL_COLORS.get(label_id, ("#ffffff", "#555555"))
+
+    def load_values(self) -> None:
+        for label_id in range(1, 10):
+            default_fg, default_bg = self.default_colors(label_id)
+            fg = normalize_hex_color(self.db.get_setting(self.setting_key(label_id, "fg"), default_fg)) or default_fg
+            bg = normalize_hex_color(self.db.get_setting(self.setting_key(label_id, "bg"), default_bg)) or default_bg
+            self.fg_edits[label_id].setText(fg)
+            self.bg_edits[label_id].setText(bg)
+            self.update_preview(label_id)
+
+    def reset_defaults(self) -> None:
+        for label_id in range(1, 10):
+            fg, bg = self.default_colors(label_id)
+            self.fg_edits[label_id].setText(fg)
+            self.bg_edits[label_id].setText(bg)
+            self.update_preview(label_id)
+
+    def pick_color(self, edit: QLineEdit) -> None:
+        initial = QColor(normalize_hex_color(edit.text()) or "#ffffff")
+        color = QColorDialog.getColor(initial, self, "色を選択")
+        if color.isValid():
+            edit.setText(color.name())
+
+    def update_preview(self, label_id: int) -> None:
+        fg = normalize_hex_color(self.fg_edits[label_id].text()) or self.default_colors(label_id)[0]
+        bg = normalize_hex_color(self.bg_edits[label_id].text()) or self.default_colors(label_id)[1]
+        self.preview_labels[label_id].setStyleSheet(f"color: {fg}; background-color: {bg}; padding: 4px; border-radius: 3px;")
+
+    def save_and_accept(self) -> None:
+        for label_id in range(1, 10):
+            default_fg, default_bg = self.default_colors(label_id)
+            fg = normalize_hex_color(self.fg_edits[label_id].text()) or default_fg
+            bg = normalize_hex_color(self.bg_edits[label_id].text()) or default_bg
+            self.db.set_setting(self.setting_key(label_id, "fg"), fg)
+            self.db.set_setting(self.setting_key(label_id, "bg"), bg)
+        self.accept()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1987,6 +2516,8 @@ class MainWindow(QMainWindow):
         self._ipc_sockets: list[QLocalSocket] = []
         self.image_viewers: list[ImageViewerWindow] = []
         self._viewer_open_offset = 0
+        self.material_label_styles = self.load_material_label_styles()
+
         self.material_load_chunk_size = 60
         self._material_load_timer = QTimer(self)
         self._material_load_timer.setInterval(0)
@@ -1995,11 +2526,23 @@ class MainWindow(QMainWindow):
         self._material_load_index = 0
         self._material_load_prompt_id: Optional[int] = None
 
+        self.thumbnail_rebuild_chunk_size = 3
+        self._thumb_rebuild_timer = QTimer(self)
+        self._thumb_rebuild_timer.setInterval(0)
+        self._thumb_rebuild_timer.timeout.connect(self.process_thumbnail_rebuild_chunk)
+        self._thumb_rebuild_rows: list[sqlite3.Row] = []
+        self._thumb_rebuild_index = 0
+        self._thumb_rebuild_prompt_id: Optional[int] = None
+        self._thumb_rebuild_count = 0
+        self._thumb_rebuild_errors: list[str] = []
+        self._thumb_rebuild_old_thumbs: list[Path] = []
+
         self.setWindowTitle(APP_NAME)
         self.apply_window_icon()
         self.resize(1320, 900)
         self.setAcceptDrops(True)
         self.build_ui()
+        self.install_internal_material_drag_guard()
         self.build_menu()
         self.connect_signals()
         self.refresh_tags()
@@ -2013,6 +2556,30 @@ class MainWindow(QMainWindow):
         self.register_global_hotkey_if_needed()
         self.setup_ipc_server()
         self.statusBar().showMessage(f"DB: {self.db_path}")
+
+    def install_internal_material_drag_guard(self) -> None:
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+
+    def is_text_drop_target(self, obj) -> bool:
+        current = obj
+        while current is not None:
+            if isinstance(current, (QLineEdit, QTextEdit)):
+                return True
+            parent = current.parent() if hasattr(current, "parent") else None
+            if parent is current:
+                break
+            current = parent
+        return False
+
+    def eventFilter(self, obj, event):  # noqa: N802 - Qt naming
+        if event.type() in (QEvent.DragEnter, QEvent.DragMove, QEvent.Drop):
+            mime_data = event.mimeData() if hasattr(event, "mimeData") else None
+            if mime_data is not None and mime_data.hasFormat(INTERNAL_MATERIAL_DRAG_MIME) and self.is_text_drop_target(obj):
+                event.ignore()
+                return True
+        return super().eventFilter(obj, event)
 
     def apply_window_icon(self) -> None:
         icon = load_window_icon()
@@ -2204,11 +2771,9 @@ class MainWindow(QMainWindow):
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(8, 0, 0, 0)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
         content = QWidget()
         form_root = QVBoxLayout(content)
-        form_root.setContentsMargins(0, 0, 8, 0)
+        form_root.setContentsMargins(0, 0, 0, 0)
 
         meta_group = QGroupBox("基本情報")
         meta_layout = QGridLayout(meta_group)
@@ -2255,15 +2820,20 @@ class MainWindow(QMainWindow):
         meta_layout.addWidget(tag_control, 2, 1, 1, 7)
         form_root.addWidget(meta_group)
 
+        compact_text_min_height = max(48, self.fontMetrics().height() * 2 + 18)
+        self.text_splitter = QSplitter(Qt.Vertical)
+        self.text_splitter.setChildrenCollapsible(False)
+        self.text_splitter.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
         prompt_group = CollapsibleGroupBox("プロンプト", "section_prompt_collapsed")
         self.collapsible_sections.append(prompt_group)
         prompt_layout = QVBoxLayout(prompt_group)
         self.prompt_edit = QTextEdit()
         self.prompt_edit.setAcceptRichText(False)
         self.prompt_edit.setPlaceholderText("ここにメインプロンプトを入力")
-        self.prompt_edit.setMinimumHeight(190)
+        self.prompt_edit.setMinimumHeight(compact_text_min_height)
         prompt_layout.addWidget(self.prompt_edit)
-        form_root.addWidget(prompt_group)
+        self.text_splitter.addWidget(prompt_group)
 
         negative_group = CollapsibleGroupBox("ネガティブ / 補助プロンプト", "section_negative_collapsed")
         self.collapsible_sections.append(negative_group)
@@ -2271,9 +2841,9 @@ class MainWindow(QMainWindow):
         self.negative_edit = QTextEdit()
         self.negative_edit.setAcceptRichText(False)
         self.negative_edit.setPlaceholderText("ネガティブプロンプトや補助プロンプト。不要なら空でOK")
-        self.negative_edit.setMinimumHeight(90)
+        self.negative_edit.setMinimumHeight(compact_text_min_height)
         negative_layout.addWidget(self.negative_edit)
-        form_root.addWidget(negative_group)
+        self.text_splitter.addWidget(negative_group)
 
         desc_group = CollapsibleGroupBox("説明 / メモ", "section_description_collapsed")
         self.collapsible_sections.append(desc_group)
@@ -2281,11 +2851,12 @@ class MainWindow(QMainWindow):
         self.description_edit = QTextEdit()
         self.description_edit.setAcceptRichText(False)
         self.description_edit.setPlaceholderText("使いどころ、成功/失敗メモ、修正方針など")
-        self.description_edit.setMinimumHeight(110)
+        self.description_edit.setMinimumHeight(compact_text_min_height)
         desc_layout.addWidget(self.description_edit)
-        form_root.addWidget(desc_group)
+        self.text_splitter.addWidget(desc_group)
 
         image_group = CollapsibleGroupBox("素材", "section_images_collapsed")
+        image_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.collapsible_sections.append(image_group)
         image_layout = QVBoxLayout(image_group)
         img_btn_row = QHBoxLayout()
@@ -2304,14 +2875,16 @@ class MainWindow(QMainWindow):
         img_btn_row.addStretch(1)
         image_layout.addLayout(img_btn_row)
         self.image_list = ImageListWidget(self)
-        image_layout.addWidget(self.image_list)
+        self.image_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        image_layout.addWidget(self.image_list, 1)
         self.drop_hint_label = QLabel("画像/動画/ファイルをここへドラッグ＆ドロップで追加できます。")
         self.drop_hint_label.setStyleSheet("color: #777;")
         image_layout.addWidget(self.drop_hint_label)
-        form_root.addWidget(image_group)
+        self.text_splitter.addWidget(image_group)
+        self.text_splitter.setSizes([260, 130, 160, 340])
+        form_root.addWidget(self.text_splitter, 1)
 
-        scroll.setWidget(content)
-        right_layout.addWidget(scroll, 1)
+        right_layout.addWidget(content, 1)
 
         splitter.addWidget(right)
         splitter.setSizes([410, 910])
@@ -2396,7 +2969,10 @@ class MainWindow(QMainWindow):
 
         tag_manage_action = QAction("タグ管理", self)
         tag_manage_action.triggered.connect(self.open_tag_manager)
+        label_manage_action = QAction("ラベル管理", self)
+        label_manage_action.triggered.connect(self.open_material_label_manager)
         settings_menu.addAction(tag_manage_action)
+        settings_menu.addAction(label_manage_action)
         settings_menu.addSeparator()
 
         font_menu = settings_menu.addMenu("文字サイズ")
@@ -2854,13 +3430,25 @@ class MainWindow(QMainWindow):
             section.set_collapsed(collapsed, emit_signal=False)
 
     def restore_splitter_sizes(self) -> None:
-        for key, splitter in [("main_splitter_sizes", self.main_splitter), ("left_splitter_sizes", self.left_splitter)]:
+        for key, splitter in [
+            ("main_splitter_sizes", self.main_splitter),
+            ("left_splitter_sizes", self.left_splitter),
+            ("text_splitter_sizes", self.text_splitter),
+        ]:
             raw = self.db.get_setting(key, "")
             if not raw:
                 continue
             try:
                 sizes = json.loads(raw)
                 if isinstance(sizes, list) and all(isinstance(v, int) for v in sizes):
+                    if key == "text_splitter_sizes":
+                        pane_count = splitter.count()
+                        if len(sizes) == 3 and pane_count == 4:
+                            sizes = list(sizes) + [340]
+                        elif len(sizes) != pane_count:
+                            sizes = list(sizes[:pane_count])
+                            while len(sizes) < pane_count:
+                                sizes.append(160)
                     splitter.setSizes(sizes)
             except Exception:
                 pass
@@ -2868,6 +3456,7 @@ class MainWindow(QMainWindow):
     def save_splitter_sizes(self) -> None:
         self.db.set_setting("main_splitter_sizes", json.dumps(self.main_splitter.sizes()))
         self.db.set_setting("left_splitter_sizes", json.dumps(self.left_splitter.sizes()))
+        self.db.set_setting("text_splitter_sizes", json.dumps(self.text_splitter.sizes()))
 
     def save_ui_state(self) -> None:
         geom = self.normalGeometry() if self.isMaximized() else self.geometry()
@@ -3258,6 +3847,65 @@ class MainWindow(QMainWindow):
             self.tags_editor.set_tags(self.db.list_prompt_tags(self.current_prompt_id))
             self.loading = False
         self.refresh_prompt_list()
+
+    def load_material_label_styles(self) -> dict[int, tuple[str, str]]:
+        styles: dict[int, tuple[str, str]] = {}
+        for label_id in range(1, 10):
+            default_fg, default_bg = DEFAULT_MATERIAL_LABEL_COLORS.get(label_id, ("#ffffff", "#555555"))
+            fg = normalize_hex_color(self.db.get_setting(f"material_label_{label_id}_fg", default_fg)) or default_fg
+            bg = normalize_hex_color(self.db.get_setting(f"material_label_{label_id}_bg", default_bg)) or default_bg
+            styles[label_id] = (fg, bg)
+        return styles
+
+    def open_material_label_manager(self) -> None:
+        dialog = MaterialLabelManagerDialog(self.db, self)
+        if dialog.exec():
+            self.material_label_styles = self.load_material_label_styles()
+            self.refresh_material_label_colors()
+            self.statusBar().showMessage("ラベル設定を更新しました")
+
+    def material_label_style(self, label_id: int) -> tuple[str, str] | None:
+        label_id = max(0, min(9, int(label_id)))
+        if label_id <= 0:
+            return None
+        return self.material_label_styles.get(label_id)
+
+    def apply_material_label_to_item(self, item: QListWidgetItem, label_id: int) -> None:
+        style = self.material_label_style(label_id)
+        # 背景色は QListWidgetItem の BackgroundRole だと IconMode + stylesheet で
+        # 描画されない/選択色に負けるため、MaterialListItemDelegate 側で描く。
+        item.setBackground(QBrush())
+        if not style:
+            item.setForeground(QBrush())
+        else:
+            fg, _bg = style
+            item.setForeground(QBrush(QColor(fg)))
+        if hasattr(self, "image_list"):
+            self.image_list.viewport().update()
+
+    def refresh_material_label_colors(self) -> None:
+        for index in range(self.image_list.count()):
+            item = self.image_list.item(index)
+            if item is None:
+                continue
+            label_id = safe_int(item.data(Qt.UserRole + 2), 0)
+            self.apply_material_label_to_item(item, label_id)
+
+    def set_selected_material_label(self, label_id: int) -> None:
+        image_id = self.selected_image_id()
+        if image_id is None:
+            return
+        label_id = max(0, min(9, int(label_id)))
+        self.db.update_image_label(image_id, label_id)
+        item = self.image_list.currentItem()
+        if item is not None:
+            item.setData(Qt.UserRole + 2, label_id)
+            self.apply_material_label_to_item(item, label_id)
+        if label_id:
+            self.statusBar().showMessage(f"素材ラベル {label_id} を設定しました")
+        else:
+            self.statusBar().showMessage("素材ラベルを解除しました")
+
 
     def ensure_current_prompt_saved_for_images(self) -> bool:
         if self.current_prompt_id is None:
@@ -3697,6 +4345,7 @@ class MainWindow(QMainWindow):
         file_path = str(row["file_path"])
         thumb_path = str(row["thumbnail_path"] or file_path)
         cover = bool(row["is_cover"])
+        label_id = int(row["label_id"] if "label_id" in row.keys() else 0)
         media_type = str(row["media_type"] if "media_type" in row.keys() else "image")
         file_name = Path(file_path).name
         stem = Path(file_path).stem
@@ -3707,7 +4356,9 @@ class MainWindow(QMainWindow):
         item = QListWidgetItem(display_label)
         item.setData(Qt.UserRole, image_id)
         item.setData(Qt.UserRole + 1, file_name)
+        item.setData(Qt.UserRole + 2, label_id)
         item.setToolTip(file_name)
+        self.apply_material_label_to_item(item, label_id)
         item.setTextAlignment(Qt.AlignHCenter | Qt.AlignTop)
         item.setSizeHint(QSize(170, 150))
         icon = icon_from_path(thumb_path, QSize(140, 105))
@@ -3722,6 +4373,55 @@ class MainWindow(QMainWindow):
         if not item:
             return None
         return int(item.data(Qt.UserRole))
+
+    def visible_material_image_ids(self) -> list[int]:
+        ids: list[int] = []
+        for index in range(self.image_list.count()):
+            item = self.image_list.item(index)
+            if item is not None:
+                try:
+                    ids.append(int(item.data(Qt.UserRole)))
+                except Exception:
+                    pass
+        return ids
+
+    def reorder_material_by_drop(self, image_id: int, insert_index: int) -> None:
+        if self.current_prompt_id is None:
+            return
+        if self._material_load_timer.isActive():
+            self.statusBar().showMessage("素材一覧の読み込み中は並び替えできません")
+            return
+        ids = self.visible_material_image_ids()
+        if image_id not in ids:
+            return
+        old_index = ids.index(image_id)
+        insert_index = max(0, min(len(ids), int(insert_index)))
+        if old_index < insert_index:
+            insert_index -= 1
+        if old_index == insert_index:
+            return
+        ids.pop(old_index)
+        insert_index = max(0, min(len(ids), insert_index))
+        ids.insert(insert_index, image_id)
+        self.db.reorder_images(self.current_prompt_id, ids)
+        self.image_list.setUpdatesEnabled(False)
+        try:
+            item = self.image_list.takeItem(old_index)
+            if item is not None:
+                self.image_list.insertItem(insert_index, item)
+                self.image_list.setCurrentItem(item)
+                self.image_list.scrollToItem(item)
+        finally:
+            self.image_list.setUpdatesEnabled(True)
+        self.statusBar().showMessage("素材の並び順を変更しました")
+
+    def select_material_in_list(self, image_id: int) -> None:
+        for index in range(self.image_list.count()):
+            item = self.image_list.item(index)
+            if item is not None and int(item.data(Qt.UserRole)) == int(image_id):
+                self.image_list.setCurrentItem(item)
+                self.image_list.scrollToItem(item)
+                return
 
     def selected_material_path(self) -> Optional[Path]:
         image_id = self.selected_image_id()
@@ -3762,13 +4462,48 @@ class MainWindow(QMainWindow):
     def rebuild_current_material_thumbnails(self) -> None:
         if self.current_prompt_id is None:
             return
+        if self._thumb_rebuild_timer.isActive():
+            self.statusBar().showMessage("サムネ再作成中です")
+            return
         prompt_id = self.current_prompt_id
         self.sync_current_prompt_assets()
         rows = self.db.list_images(prompt_id)
-        rebuilt = 0
-        errors: list[str] = []
-        old_thumbs_to_recycle: list[Path] = []
-        for row in rows:
+        if not rows:
+            self.statusBar().showMessage("再作成するサムネがありません")
+            return
+
+        self._thumb_rebuild_rows = list(rows)
+        self._thumb_rebuild_index = 0
+        self._thumb_rebuild_prompt_id = prompt_id
+        self._thumb_rebuild_count = 0
+        self._thumb_rebuild_errors = []
+        self._thumb_rebuild_old_thumbs = []
+        self.rebuild_thumbnails_button.setEnabled(False)
+        self.statusBar().showMessage(f"サムネ再作成中... 0/{len(self._thumb_rebuild_rows)}")
+        self._thumb_rebuild_timer.start()
+
+    def cancel_thumbnail_rebuild(self) -> None:
+        if self._thumb_rebuild_timer.isActive():
+            self._thumb_rebuild_timer.stop()
+        self._thumb_rebuild_rows = []
+        self._thumb_rebuild_index = 0
+        self._thumb_rebuild_prompt_id = None
+        self._thumb_rebuild_count = 0
+        self._thumb_rebuild_errors = []
+        self._thumb_rebuild_old_thumbs = []
+        if hasattr(self, "rebuild_thumbnails_button"):
+            self.rebuild_thumbnails_button.setEnabled(True)
+
+    def process_thumbnail_rebuild_chunk(self) -> None:
+        prompt_id = self._thumb_rebuild_prompt_id
+        if prompt_id is None or prompt_id != self.current_prompt_id:
+            self.cancel_thumbnail_rebuild()
+            self.statusBar().showMessage("サムネ再作成をキャンセルしました")
+            return
+
+        total = len(self._thumb_rebuild_rows)
+        end_index = min(total, self._thumb_rebuild_index + self.thumbnail_rebuild_chunk_size)
+        for row in self._thumb_rebuild_rows[self._thumb_rebuild_index:end_index]:
             image_id = int(row["id"])
             file_path = Path(str(row["file_path"] or ""))
             if not file_path.exists():
@@ -3781,13 +4516,24 @@ class MainWindow(QMainWindow):
                     raise RuntimeError("サムネを作成できませんでした。")
                 self.db.update_image_thumbnail(image_id, str(new_thumb))
                 if old_thumb.exists() and old_thumb.resolve() != new_thumb.resolve():
-                    old_thumbs_to_recycle.append(old_thumb)
-                rebuilt += 1
+                    self._thumb_rebuild_old_thumbs.append(old_thumb)
+                self._thumb_rebuild_count += 1
             except Exception as exc:
-                errors.append(f"{file_path.name}: {exc}")
+                self._thumb_rebuild_errors.append(f"{file_path.name}: {exc}")
 
-        if old_thumbs_to_recycle:
-            move_paths_to_recycle_bin(old_thumbs_to_recycle)
+        self._thumb_rebuild_index = end_index
+        if self._thumb_rebuild_index < total:
+            self.statusBar().showMessage(f"サムネ再作成中... {self._thumb_rebuild_index}/{total}")
+            return
+
+        self._thumb_rebuild_timer.stop()
+        rebuilt = self._thumb_rebuild_count
+        errors = list(self._thumb_rebuild_errors)
+        old_thumbs = list(self._thumb_rebuild_old_thumbs)
+        self.cancel_thumbnail_rebuild()
+
+        if old_thumbs:
+            move_paths_to_recycle_bin(old_thumbs)
         QPixmapCache.clear()
         self.refresh_images(sync_assets=False)
         self.refresh_prompt_list()
@@ -3924,6 +4670,13 @@ class MainWindow(QMainWindow):
         copy_action = menu.addAction("コピー")
         rename_action = menu.addAction("ファイル名の変更")
         cover_action = menu.addAction("カバーにする")
+        label_menu = menu.addMenu("ラベル")
+        label_actions: dict[QAction, int] = {}
+        for label_id in range(1, 10):
+            action = label_menu.addAction(str(label_id))
+            label_actions[action] = label_id
+        clear_label_action = label_menu.addAction("解除")
+        label_actions[clear_label_action] = 0
         menu.addSeparator()
         delete_action = menu.addAction("削除")
         menu.addSeparator()
@@ -3937,6 +4690,8 @@ class MainWindow(QMainWindow):
             self.rename_selected_image()
         elif selected == cover_action:
             self.set_selected_image_as_cover()
+        elif selected in label_actions:
+            self.set_selected_material_label(label_actions[selected])
         elif selected == delete_action:
             self.remove_selected_image()
         elif selected == property_action:
@@ -3955,6 +4710,30 @@ class MainWindow(QMainWindow):
         else:
             open_path(path)
 
+    def force_activate_widget(self, widget: QWidget) -> None:
+        widget.show()
+        widget.raise_()
+        widget.activateWindow()
+        if not sys.platform.startswith("win"):
+            return
+        try:
+            import ctypes
+
+            hwnd = int(widget.winId())
+            user32 = ctypes.windll.user32
+            SW_SHOWNORMAL = 1
+            HWND_TOPMOST = -1
+            HWND_NOTOPMOST = -2
+            SWP_NOSIZE = 0x0001
+            SWP_NOMOVE = 0x0002
+            SWP_SHOWWINDOW = 0x0040
+            user32.ShowWindow(hwnd, SW_SHOWNORMAL)
+            user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+            user32.SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+            user32.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+
     def open_image_viewer(self, path: Path, external_image: bool = False) -> None:
         if not path.exists():
             QMessageBox.warning(self, "画像表示エラー", "画像ファイルが見つかりません。")
@@ -3962,7 +4741,9 @@ class MainWindow(QMainWindow):
         viewer = ImageViewerWindow(self, path, ImageViewerWindow.MODE_FRAMELESS, external_image=external_image)
         self.image_viewers.append(viewer)
         viewer.show()
-        viewer.activateWindow()
+        self.force_activate_widget(viewer)
+        QTimer.singleShot(0, lambda v=viewer: self.force_activate_widget(v) if v.isVisible() else None)
+        QTimer.singleShot(250, lambda v=viewer: self.force_activate_widget(v) if v.isVisible() else None)
 
     def replace_image_viewer_mode(self, old_viewer: ImageViewerWindow, mode: str) -> None:
         geometry = QRect(old_viewer.geometry())
@@ -3987,9 +4768,9 @@ class MainWindow(QMainWindow):
             viewer.center_image_if_needed()
         self.image_viewers.append(viewer)
         viewer.showNormal()
-        viewer.raise_()
-        viewer.activateWindow()
+        self.force_activate_widget(viewer)
         QTimer.singleShot(0, viewer.showNormal)
+        QTimer.singleShot(0, lambda v=viewer: self.force_activate_widget(v) if v.isVisible() else None)
 
     def unregister_image_viewer(self, viewer: ImageViewerWindow) -> None:
         if viewer in self.image_viewers:
@@ -4116,6 +4897,7 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self.cancel_material_list_loading()
+        self.cancel_thumbnail_rebuild()
         self.close_all_image_viewers()
         self.save_ui_state()
         self.unregister_global_hotkey()

@@ -8,6 +8,9 @@
 
 #define PIPE_NAME L"\\\\.\\pipe\\chappy.ai-prompt-organizer.ipc"
 #define MAIN_EXE_NAME L"ai-prompt-organizer.exe"
+#ifndef ASFW_ANY
+#define ASFW_ANY ((DWORD)-1)
+#endif
 
 static void append_wchar(wchar_t **buf, size_t *cap, size_t *len, wchar_t ch) {
     if (*len + 2 >= *cap) {
@@ -101,6 +104,7 @@ static char *build_ipc_payload(int argc, wchar_t **argv) {
 }
 
 static BOOL try_send_ipc(int argc, wchar_t **argv) {
+    AllowSetForegroundWindow(ASFW_ANY);
     if (!WaitNamedPipeW(PIPE_NAME, 80)) {
         // Try once anyway; the pipe may be available between checks.
     }
