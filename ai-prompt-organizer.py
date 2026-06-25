@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-AI Prompt Organizer v82
+AI Prompt Organizer v91
 
 AI生成用プロンプトを、タイトル・タグ・説明・画像付きで管理するローカルGUIツール。
 PySide6 + SQLite で動作します。
@@ -74,7 +74,7 @@ except Exception as exc:  # pragma: no cover - 実行環境向けメッセージ
 
 
 APP_NAME = "AI Prompt Organizer"
-APP_VERSION = "v1.20.2"
+APP_VERSION = "v1.20.11"
 APP_AUTHOR = "MF235"
 APP_CONTACT_X = "https://x.com/MF235XBR"
 APP_REPOSITORY = "https://github.com/mf235/ai-prompt-organizer"
@@ -105,6 +105,10 @@ IMAGE_VIEWER_RESIZE_METHODS = [
 ]
 IMAGE_VIEWER_RESIZE_METHOD_KEYS = {key for key, _label in IMAGE_VIEWER_RESIZE_METHODS}
 DEFAULT_IMAGE_VIEWER_RESIZE_METHOD = "bicubic"
+LEFT_TAG_FILTER_DEFAULT_HEIGHT = 260
+LEFT_TAG_FILTER_MIN_HEIGHT = 120
+LEFT_PINNED_PROMPT_MIN_HEIGHT = 0
+LEFT_PROMPT_LIST_MIN_HEIGHT = 120
 
 DEFAULT_MATERIAL_LABEL_COLORS = {
     1: ("#ffffff", "#d32f2f"),
@@ -658,6 +662,37 @@ class Database:
         self.conn.execute("UPDATE images SET label_id = ? WHERE id = ?", (label_id, image_id))
         self.conn.commit()
 
+    def move_image_to_prompt(self, image_id: int, target_prompt_id: int, file_path: str, thumbnail_path: str) -> None:
+        row = self.get_image(image_id)
+        if not row:
+            return
+        source_prompt_id = int(row["prompt_id"])
+        target_prompt_id = int(target_prompt_id)
+        cur = self.conn.cursor()
+        target_count = cur.execute("SELECT COUNT(*) AS c FROM images WHERE prompt_id = ?", (target_prompt_id,)).fetchone()["c"]
+        max_sort = cur.execute("SELECT COALESCE(MAX(sort_order), -1) AS max_sort FROM images WHERE prompt_id = ?", (target_prompt_id,)).fetchone()["max_sort"]
+        is_cover = 1 if int(target_count) == 0 else 0
+        cur.execute(
+            """
+            UPDATE images
+            SET prompt_id = ?, file_path = ?, thumbnail_path = ?, sort_order = ?, is_cover = ?
+            WHERE id = ?
+            """,
+            (target_prompt_id, file_path, thumbnail_path, int(max_sort) + 1, is_cover, image_id),
+        )
+        if source_prompt_id != target_prompt_id:
+            has_cover = cur.execute(
+                "SELECT COUNT(*) AS c FROM images WHERE prompt_id = ? AND is_cover = 1", (source_prompt_id,)
+            ).fetchone()["c"]
+            if int(has_cover) == 0:
+                first = cur.execute(
+                    "SELECT id FROM images WHERE prompt_id = ? ORDER BY sort_order ASC, id ASC LIMIT 1",
+                    (source_prompt_id,),
+                ).fetchone()
+                if first:
+                    cur.execute("UPDATE images SET is_cover = 1 WHERE id = ?", (int(first["id"]),))
+        self.conn.commit()
+
     def list_images(self, prompt_id: int) -> list[sqlite3.Row]:
         return self.conn.execute(
             "SELECT * FROM images WHERE prompt_id = ? ORDER BY sort_order ASC, id ASC",
@@ -1079,6 +1114,70 @@ class PromptListItemWidget(QWidget):
         text_layout.addStretch(1)
         layout.addLayout(text_layout, 1)
 
+
+class PromptListWidget(QListWidget):
+    def __init__(self, main_window: "MainWindow"):
+        super().__init__()
+        self.main_window = main_window
+        self.setAcceptDrops(True)
+        self.setDragEnabled(False)
+        self.setDragDropMode(QAbstractItemView.DropOnly)
+        self.setDropIndicatorShown(False)
+        self.setDefaultDropAction(Qt.CopyAction)
+
+    def event_local_pos(self, event) -> QPoint:
+        if hasattr(event, "position"):
+            return event.position().toPoint()
+        return event.pos()
+
+    def is_material_drop(self, event) -> bool:
+        return event.mimeData().hasFormat(INTERNAL_MATERIAL_DRAG_MIME)
+
+    def dragged_material_image_id(self, event) -> Optional[int]:
+        if not self.is_material_drop(event):
+            return None
+        try:
+            return int(bytes(event.mimeData().data(INTERNAL_MATERIAL_DRAG_MIME)).decode("utf-8"))
+        except Exception:
+            return None
+
+    def prompt_item_at_event(self, event) -> Optional[QListWidgetItem]:
+        return self.itemAt(self.event_local_pos(event))
+
+    def dragEnterEvent(self, event):  # noqa: N802 - Qt naming
+        if self.is_material_drop(event):
+            event.setDropAction(Qt.CopyAction)
+            event.accept()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):  # noqa: N802 - Qt naming
+        if self.is_material_drop(event) and self.prompt_item_at_event(event) is not None:
+            event.setDropAction(Qt.CopyAction)
+            event.accept()
+            return
+        event.ignore()
+
+    def dropEvent(self, event):  # noqa: N802 - Qt naming
+        if not self.is_material_drop(event):
+            super().dropEvent(event)
+            return
+        image_id = self.dragged_material_image_id(event)
+        item = self.prompt_item_at_event(event)
+        if image_id is None or item is None:
+            event.ignore()
+            return
+        try:
+            target_prompt_id = int(item.data(Qt.UserRole))
+        except Exception:
+            event.ignore()
+            return
+        copy_mode = bool(QApplication.keyboardModifiers() & Qt.ControlModifier)
+        if self.main_window.transfer_material_to_prompt(image_id, target_prompt_id, copy_mode=copy_mode):
+            event.setDropAction(Qt.CopyAction)
+            event.accept()
+        else:
+            event.ignore()
 
 
 class MaterialListItemDelegate(QStyledItemDelegate):
@@ -1775,15 +1874,14 @@ class ImageViewerWindow(QWidget):
         close_action.triggered.connect(self.close)
         menu.addAction(frameless_action)
         menu.addAction(scroll_action)
-        if self.external_image:
-            add_menu = menu.addMenu("素材へ追加")
-            add_current_action = QAction("現在のカードへ追加", self)
-            add_current_action.setEnabled(self.main_window.current_prompt_id is not None)
-            add_new_action = QAction("新規カードを作って追加", self)
-            add_current_action.triggered.connect(lambda: self.main_window.add_external_image_to_current_prompt(self.image_path))
-            add_new_action.triggered.connect(lambda: self.main_window.add_external_image_to_new_prompt(self.image_path))
-            add_menu.addAction(add_current_action)
-            add_menu.addAction(add_new_action)
+        add_menu = menu.addMenu("素材へ追加")
+        add_current_action = QAction("現在のカードへ追加", self)
+        add_current_action.setEnabled(self.main_window.current_prompt_id is not None)
+        add_new_action = QAction("新規カードを作って追加", self)
+        add_current_action.triggered.connect(lambda: self.main_window.add_external_image_to_current_prompt(self.image_path))
+        add_new_action.triggered.connect(lambda: self.main_window.add_external_image_to_new_prompt(self.image_path))
+        add_menu.addAction(add_current_action)
+        add_menu.addAction(add_new_action)
         menu.addSeparator()
         menu.addAction(close_all_action)
         menu.addAction(close_action)
@@ -2548,6 +2646,7 @@ class MainWindow(QMainWindow):
         self.tag_presets: dict[str, list[str]] = {}
         self.collapsible_sections: list[CollapsibleGroupBox] = []
         self.warned_invalid_image_folder_files: set[str] = set()
+        self._pending_pinned_area_update = False
         self.current_font_size = max(9, min(25, safe_int(self.db.get_setting("font_size", "10"), 10)))
         self.font_size_actions: dict[int, QAction] = {}
         self.image_viewer_resize_method = normalize_image_viewer_resize_method(
@@ -2607,6 +2706,7 @@ class MainWindow(QMainWindow):
         self.apply_font_size(self.current_font_size, save=False)
         self.restore_ui_state()
         self.refresh_prompt_list()
+        self.schedule_startup_left_splitter_restore()
         self.setup_tray_icon()
         self.update_quit_on_last_window_closed()
         self.register_global_hotkey_if_needed()
@@ -2791,6 +2891,8 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.search_edit)
 
         tag_box = QGroupBox("タグ絞り込み")
+        tag_box.setMinimumHeight(LEFT_TAG_FILTER_MIN_HEIGHT)
+        tag_box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Ignored)
         tag_layout = QVBoxLayout(tag_box)
         tag_layout.setContentsMargins(8, 8, 8, 8)
         self.tag_filter_content = QWidget()
@@ -2799,8 +2901,9 @@ class MainWindow(QMainWindow):
         self.tag_filter_scroll = QScrollArea()
         self.tag_filter_scroll.setWidgetResizable(True)
         self.tag_filter_scroll.setWidget(self.tag_filter_content)
-        self.tag_filter_scroll.setMinimumHeight(120)
-        tag_layout.addWidget(self.tag_filter_scroll)
+        self.tag_filter_scroll.setMinimumHeight(0)
+        self.tag_filter_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored)
+        tag_layout.addWidget(self.tag_filter_scroll, 1)
         tag_btn_row = QHBoxLayout()
         self.clear_tags_button = QPushButton("解除")
         self.only_favorite_checkbox = QCheckBox("お気に入りのみ")
@@ -2814,7 +2917,7 @@ class MainWindow(QMainWindow):
         )
         pinned_layout = QVBoxLayout(self.pinned_prompt_group)
         pinned_layout.setContentsMargins(6, 10, 6, 6)
-        self.pinned_prompt_list = QListWidget()
+        self.pinned_prompt_list = PromptListWidget(self)
         self.pinned_prompt_list.setIconSize(QSize(96, 72))
         self.pinned_prompt_list.setUniformItemSizes(False)
         self.pinned_prompt_list.setSpacing(4)
@@ -2824,20 +2927,28 @@ class MainWindow(QMainWindow):
         self.pinned_prompt_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.pinned_prompt_list.setStyleSheet("QListWidget { background: #fffaf0; border: 1px solid #eadb9f; }")
         pinned_layout.addWidget(self.pinned_prompt_list)
+        self.pinned_prompt_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.pinned_prompt_group.setVisible(False)
 
-        self.prompt_list = QListWidget()
+        self.prompt_list = PromptListWidget(self)
         self.prompt_list.setIconSize(QSize(96, 72))
         self.prompt_list.setUniformItemSizes(False)
         self.prompt_list.setSpacing(4)
         self.prompt_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.prompt_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.prompt_list.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+
+        self.left_bottom_widget = QWidget()
+        left_bottom_layout = QVBoxLayout(self.left_bottom_widget)
+        left_bottom_layout.setContentsMargins(0, 0, 0, 0)
+        left_bottom_layout.setSpacing(6)
+        left_bottom_layout.addWidget(self.pinned_prompt_group)
+        left_bottom_layout.addWidget(self.prompt_list, 1)
 
         self.left_splitter = QSplitter(Qt.Vertical)
         self.left_splitter.addWidget(tag_box)
-        self.left_splitter.addWidget(self.pinned_prompt_group)
-        self.left_splitter.addWidget(self.prompt_list)
-        self.left_splitter.setSizes([260, 160, 540])
+        self.left_splitter.addWidget(self.left_bottom_widget)
+        self.left_splitter.setSizes([LEFT_TAG_FILTER_DEFAULT_HEIGHT, 540])
         left_layout.addWidget(self.left_splitter, 1)
 
         splitter.addWidget(left)
@@ -2865,19 +2976,38 @@ class MainWindow(QMainWindow):
         self.preset_combo.addItem("タグプリセットを追加...")
         self.add_preset_button = QPushButton("追加")
 
+        meta_layout.setColumnStretch(1, 1)
+
         meta_layout.addWidget(QLabel("タイトル"), 0, 0)
-        meta_layout.addWidget(self.title_edit, 0, 1, 1, 4)
-        meta_layout.addWidget(self.favorite_check, 0, 5)
-        rating_label = QLabel("評価")
-        rating_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        meta_layout.addWidget(rating_label, 0, 6)
-        meta_layout.addWidget(self.rating_combo, 0, 7)
+        title_row = QWidget()
+        title_row_layout = QHBoxLayout(title_row)
+        title_row_layout.setContentsMargins(0, 0, 0, 0)
+        title_row_layout.setSpacing(0)
+        title_row_layout.addWidget(self.title_edit, 1)
+        title_row_layout.addSpacing(6)
+        title_row_layout.addWidget(self.favorite_check)
+        title_row_layout.addSpacing(6)
+        title_row_layout.addWidget(QLabel("評価"))
+        title_row_layout.addWidget(self.rating_combo)
+        meta_layout.addWidget(title_row, 0, 1, 1, 7)
+
         meta_layout.addWidget(QLabel("使用AI"), 1, 0)
-        meta_layout.addWidget(self.engine_edit, 1, 1)
-        meta_layout.addWidget(QLabel("モデル"), 1, 2)
-        meta_layout.addWidget(self.model_edit, 1, 3)
-        meta_layout.addWidget(QLabel("プロジェクト"), 1, 4)
-        meta_layout.addWidget(self.project_edit, 1, 5, 1, 3)
+        ai_row = QWidget()
+        ai_row_layout = QHBoxLayout(ai_row)
+        ai_row_layout.setContentsMargins(0, 0, 0, 0)
+        ai_row_layout.setSpacing(0)
+        for combo in (self.engine_edit, self.model_edit, self.project_edit):
+            combo.setMinimumWidth(150)
+            combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        field_gap = 10
+        ai_row_layout.addWidget(self.engine_edit, 1)
+        ai_row_layout.addSpacing(field_gap)
+        ai_row_layout.addWidget(QLabel("モデル"))
+        ai_row_layout.addWidget(self.model_edit, 1)
+        ai_row_layout.addSpacing(field_gap)
+        ai_row_layout.addWidget(QLabel("プロジェクト"))
+        ai_row_layout.addWidget(self.project_edit, 1)
+        meta_layout.addWidget(ai_row, 1, 1, 1, 7)
         tag_label = QLabel("タグ")
         tag_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         tag_control = QWidget()
@@ -3509,10 +3639,60 @@ class MainWindow(QMainWindow):
             collapsed = self.db.get_setting(section.state_key, "0") == "1"
             section.set_collapsed(collapsed, emit_signal=False)
 
+    def default_left_splitter_sizes(self) -> list[int]:
+        total = self.left_splitter.height() if hasattr(self, "left_splitter") else 0
+        if total <= 0:
+            total = max(700, self.height() - 120)
+        tag_height = LEFT_TAG_FILTER_DEFAULT_HEIGHT
+        bottom_height = max(LEFT_PROMPT_LIST_MIN_HEIGHT, total - tag_height)
+        return [tag_height, bottom_height]
+
+    def load_left_splitter_sizes_setting(self) -> list[int] | None:
+        # v90以降は、ピン留めをsplitterの一要素にせず、
+        # 「タグ絞り込み」と「ピン留め+カード一覧」の2分割だけを保存する。
+        raw = self.db.get_setting("left_splitter_sizes_v3", "")
+        if raw:
+            try:
+                sizes = json.loads(raw)
+                if isinstance(sizes, list) and len(sizes) >= 2:
+                    values = [max(0, int(v)) for v in sizes[:2]]
+                    if sum(values) > 0:
+                        return values
+            except Exception:
+                pass
+
+        # v88〜v90で壊れた高さが left_splitter_sizes / left_splitter_sizes_v2 に
+        # 保存されていることがあるため、自動復元には使わない。
+        # v91以降の終了時サイズだけを left_splitter_sizes_v3 として保存・復元する。
+        return None
+
+    def normalize_left_splitter_sizes(self, sizes: list[int]) -> list[int]:
+        values = [max(0, int(v)) for v in list(sizes[:2])]
+        while len(values) < 2:
+            values.append(0)
+
+        total = self.left_splitter.height()
+        if total <= 0:
+            total = sum(values) or max(700, self.height() - 120)
+
+        if values[0] < LEFT_TAG_FILTER_MIN_HEIGHT:
+            values[0] = LEFT_TAG_FILTER_MIN_HEIGHT
+        if values[1] < LEFT_PROMPT_LIST_MIN_HEIGHT:
+            values[1] = LEFT_PROMPT_LIST_MIN_HEIGHT
+
+        used = sum(values)
+        if total > 0 and used != total:
+            diff = total - used
+            values[1] = max(LEFT_PROMPT_LIST_MIN_HEIGHT, values[1] + diff)
+            if values[1] == LEFT_PROMPT_LIST_MIN_HEIGHT and diff < 0:
+                overflow = sum(values) - total
+                if overflow > 0 and values[0] > LEFT_TAG_FILTER_MIN_HEIGHT:
+                    values[0] -= min(overflow, values[0] - LEFT_TAG_FILTER_MIN_HEIGHT)
+        return values
+
     def restore_splitter_sizes(self) -> None:
         for key, splitter in [
             ("main_splitter_sizes", self.main_splitter),
-            ("left_splitter_sizes", self.left_splitter),
             ("text_splitter_sizes", self.text_splitter),
         ]:
             raw = self.db.get_setting(key, "")
@@ -3532,10 +3712,21 @@ class MainWindow(QMainWindow):
                     splitter.setSizes(sizes)
             except Exception:
                 pass
+        self.restore_left_splitter_sizes()
+
+    def restore_left_splitter_sizes(self) -> None:
+        if not hasattr(self, "left_splitter"):
+            return
+        sizes = self.load_left_splitter_sizes_setting() or self.default_left_splitter_sizes()
+        self.left_splitter.setSizes(self.normalize_left_splitter_sizes(sizes))
+
+    def schedule_startup_left_splitter_restore(self) -> None:
+        QTimer.singleShot(0, self.restore_left_splitter_sizes)
+        QTimer.singleShot(150, self.restore_left_splitter_sizes)
 
     def save_splitter_sizes(self) -> None:
         self.db.set_setting("main_splitter_sizes", json.dumps(self.main_splitter.sizes()))
-        self.db.set_setting("left_splitter_sizes", json.dumps(self.left_splitter.sizes()))
+        self.db.set_setting("left_splitter_sizes_v3", json.dumps(self.left_splitter.sizes()))
         self.db.set_setting("text_splitter_sizes", json.dumps(self.text_splitter.sizes()))
 
     def save_ui_state(self) -> None:
@@ -3659,19 +3850,55 @@ class MainWindow(QMainWindow):
         target_list.addItem(item)
         target_list.setItemWidget(item, widget)
 
+    def schedule_pinned_prompt_area_update(self) -> None:
+        if getattr(self, "_pending_pinned_area_update", False):
+            return
+        self._pending_pinned_area_update = True
+
+        def _run() -> None:
+            self._pending_pinned_area_update = False
+            self.update_pinned_prompt_area_height()
+
+        QTimer.singleShot(0, _run)
+
     def update_pinned_prompt_area_height(self) -> None:
         count = self.pinned_prompt_list.count()
         if count <= 0:
             self.pinned_prompt_group.setVisible(False)
+            self.pinned_prompt_list.setFixedHeight(0)
+            self.pinned_prompt_group.setFixedHeight(0)
             return
+
         self.pinned_prompt_group.setVisible(True)
+        self.pinned_prompt_list.doItemsLayout()
+        self.pinned_prompt_list.updateGeometries()
+        self.pinned_prompt_list.viewport().updateGeometry()
+
         row_height = 0
         for index in range(count):
-            row_height += self.pinned_prompt_list.item(index).sizeHint().height()
-        list_height = row_height + max(0, count - 1) * self.pinned_prompt_list.spacing() + 10
-        group_height = list_height + 34
+            item = self.pinned_prompt_list.item(index)
+            if item is None:
+                continue
+            item_height = self.pinned_prompt_list.sizeHintForRow(index)
+            if item_height <= 0:
+                item_height = item.sizeHint().height()
+            widget = self.pinned_prompt_list.itemWidget(item)
+            if widget is not None:
+                widget.ensurePolished()
+                item_height = max(item_height, widget.sizeHint().height(), widget.minimumSizeHint().height())
+            row_height += max(item_height, self.pinned_prompt_list.iconSize().height() + 8)
+
+        spacing_height = max(0, count - 1) * self.pinned_prompt_list.spacing()
+        frame_height = self.pinned_prompt_list.frameWidth() * 2
+        list_height = row_height + spacing_height + frame_height + 8
+        margins = self.pinned_prompt_group.layout().contentsMargins()
+        title_height = max(24, self.pinned_prompt_group.fontMetrics().height() + 10)
+        group_height = list_height + margins.top() + margins.bottom() + title_height
+
         self.pinned_prompt_list.setFixedHeight(list_height)
         self.pinned_prompt_group.setFixedHeight(group_height)
+        self.pinned_prompt_list.updateGeometry()
+        self.pinned_prompt_group.updateGeometry()
 
     def refresh_prompt_list(self) -> None:
         if self.loading:
@@ -3716,6 +3943,7 @@ class MainWindow(QMainWindow):
         self.prompt_list.blockSignals(False)
         self.pinned_prompt_list.blockSignals(False)
         self.update_pinned_prompt_area_height()
+        self.schedule_pinned_prompt_area_update()
         if pinned_count:
             self.statusBar().showMessage(f"{matched_count} 件表示 / ピン留め {pinned_count} 件 / DB: {self.db_path}")
         else:
@@ -4108,6 +4336,107 @@ class MainWindow(QMainWindow):
         self.load_prompt(new_id)
         self.add_images_from_paths([path])
 
+    def add_selected_material_to_new_prompt(self) -> None:
+        image_id = self.selected_image_id()
+        if image_id is None:
+            return
+        row = self.db.get_image(image_id)
+        if not row:
+            return
+        src_path = Path(str(row["file_path"] or ""))
+        if not src_path.exists() or not src_path.is_file():
+            QMessageBox.warning(self, "素材追加エラー", f"素材ファイルが見つかりません。\n{src_path}")
+            return
+        if not self.maybe_save_dirty():
+            return
+
+        original_name = str(row["original_name"] if "original_name" in row.keys() else "")
+        title_source = original_name or src_path.name
+        title = Path(title_source).stem.strip() or src_path.stem.strip() or "新規プロンプト"
+        new_id = self.db.create_prompt(title)
+        self.db.set_prompt_tags(new_id, [])
+
+        if not self.transfer_material_to_prompt(image_id, new_id, copy_mode=True):
+            self.db.delete_prompt(new_id)
+            self.refresh_prompt_list()
+            self.select_prompt_in_list(self.current_prompt_id) if self.current_prompt_id is not None else None
+            return
+
+        self.current_prompt_id = new_id
+        self.refresh_prompt_list()
+        self.select_prompt_in_list(new_id)
+        self.load_prompt(new_id)
+        self.statusBar().showMessage("新規カードを作成して素材を追加しました")
+
+    def material_destination_dir(self, prompt_id: int, media_type: str, src_path: Path) -> Path:
+        image_dir, file_dir, _thumb_dir = self.ensure_prompt_asset_dirs(prompt_id)
+        return image_dir if (media_type or media_type_for_path(src_path)) == "image" else file_dir
+
+    def transfer_material_to_prompt(self, image_id: int, target_prompt_id: int, copy_mode: bool = False) -> bool:
+        row = self.db.get_image(image_id)
+        if not row:
+            return False
+        source_prompt_id = int(row["prompt_id"])
+        target_prompt_id = int(target_prompt_id)
+        if source_prompt_id == target_prompt_id and not copy_mode:
+            self.statusBar().showMessage("同じカードへの素材移動は行いませんでした")
+            return False
+
+        src_path = Path(str(row["file_path"]))
+        if not src_path.exists() or not src_path.is_file():
+            QMessageBox.warning(self, "素材D&Dエラー", f"素材ファイルが見つかりません。\n{src_path}")
+            return False
+
+        media_type = str(row["media_type"] if "media_type" in row.keys() else media_type_for_path(src_path))
+        target_dir = self.material_destination_dir(target_prompt_id, media_type, src_path)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        dest_path = unique_path(target_dir / safe_filename(src_path.name))
+        caption = str(row["caption"] if "caption" in row.keys() else "")
+        original_name = str(row["original_name"] if "original_name" in row.keys() else src_path.name)
+        label_id = safe_int(row["label_id"] if "label_id" in row.keys() else 0, 0)
+
+        try:
+            if copy_mode:
+                shutil.copy2(src_path, dest_path)
+                new_image_id = self.db.add_image(
+                    target_prompt_id,
+                    str(dest_path),
+                    "",
+                    caption=caption,
+                    media_type=media_type,
+                    original_name=original_name or src_path.name,
+                )
+                thumb_path = self.create_material_thumbnail(dest_path, new_image_id, target_prompt_id, media_type)
+                if thumb_path:
+                    self.db.update_image_thumbnail(new_image_id, str(thumb_path))
+                if label_id:
+                    self.db.update_image_label(new_image_id, label_id)
+                message = "素材をコピーしました"
+            else:
+                old_thumb_path = Path(str(row["thumbnail_path"] or ""))
+                if src_path.resolve() != dest_path.resolve():
+                    shutil.move(str(src_path), str(dest_path))
+                thumb_path = self.create_material_thumbnail(dest_path, image_id, target_prompt_id, media_type)
+                new_thumb_path = str(thumb_path) if thumb_path else ""
+                self.db.move_image_to_prompt(image_id, target_prompt_id, str(dest_path), new_thumb_path)
+                if old_thumb_path.exists() and (not thumb_path or old_thumb_path.resolve() != thumb_path.resolve()):
+                    try:
+                        old_thumb_path.unlink()
+                    except Exception:
+                        pass
+                remove_empty_dirs(self.prompt_asset_dir(source_prompt_id))
+                message = "素材を移動しました"
+        except Exception as exc:
+            QMessageBox.warning(self, "素材D&Dエラー", f"素材を{'コピー' if copy_mode else '移動'}できませんでした。\n\n{exc}")
+            return False
+
+        if self.current_prompt_id in (source_prompt_id, target_prompt_id):
+            self.refresh_images()
+        self.refresh_prompt_list()
+        self.select_prompt_in_list(self.current_prompt_id) if self.current_prompt_id is not None else None
+        self.statusBar().showMessage(message)
+        return True
+
     def add_images_from_paths(self, paths: Iterable[Path]) -> None:
         paths = [Path(p) for p in paths if Path(p).exists() and Path(p).is_file()]
         if not paths:
@@ -4177,25 +4506,48 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"素材を {added} 件追加しました")
 
     def ask_video_import_mode(self, src: Path, allow_apply_all: bool = False) -> tuple[Optional[str], bool]:
-        box = QMessageBox(self)
-        box.setWindowTitle("動画追加")
-        box.setText(f"動画をどう追加しますか？\n{src.name}")
-        thumb_button = box.addButton("サムネ画像のみ作成", QMessageBox.AcceptRole)
-        copy_button = box.addButton("動画をコピーして登録", QMessageBox.ActionRole)
-        cancel_button = box.addButton("キャンセル", QMessageBox.RejectRole)
+        dialog = QDialog(self)
+        dialog.setWindowTitle("動画追加")
+        layout = QVBoxLayout(dialog)
+
+        label = QLabel(f"動画をどう追加しますか？\n{src.name}")
+        label.setWordWrap(True)
+        layout.addWidget(label)
+
         apply_checkbox: Optional[QCheckBox] = None
         if allow_apply_all:
             apply_checkbox = QCheckBox("今後すべてに適用")
-            box.setCheckBox(apply_checkbox)
-        box.setDefaultButton(thumb_button)
-        box.setEscapeButton(cancel_button)
-        box.exec()
+            layout.addWidget(apply_checkbox)
+
+        button_row = QHBoxLayout()
+        copy_button = QPushButton("動画をコピーして登録")
+        thumb_button = QPushButton("サムネ画像のみ作成")
+        cancel_button = QPushButton("キャンセル")
+        button_row.addWidget(copy_button)
+        button_row.addWidget(thumb_button)
+        button_row.addStretch(1)
+        button_row.addWidget(cancel_button)
+        layout.addLayout(button_row)
+
+        selected_mode: dict[str, Optional[str]] = {"mode": None}
+
+        def choose(mode: str) -> None:
+            selected_mode["mode"] = mode
+            dialog.accept()
+
+        copy_button.clicked.connect(lambda: choose("copy"))
+        thumb_button.clicked.connect(lambda: choose("thumb"))
+        cancel_button.clicked.connect(dialog.reject)
+        dialog.setDefaultButton(copy_button) if hasattr(dialog, "setDefaultButton") else None
+        copy_button.setDefault(True)
+        copy_button.setFocus()
+
+        if dialog.exec() != QDialog.Accepted:
+            return None, False
         apply_all = bool(apply_checkbox and apply_checkbox.isChecked())
-        clicked = box.clickedButton()
-        if clicked == thumb_button:
-            return "thumb", apply_all
-        if clicked == copy_button:
-            return "copy", apply_all
+        mode = selected_mode.get("mode")
+        if mode in {"copy", "thumb"}:
+            return mode, apply_all
         return None, False
 
     def create_material_thumbnail(self, src: Path, image_id: int, prompt_id: int, media_type: str = "") -> Optional[Path]:
@@ -4830,6 +5182,7 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         open_action = menu.addAction("開く")
         copy_action = menu.addAction("コピー")
+        add_new_card_action = menu.addAction("新規カードを作って追加")
         rename_action = menu.addAction("ファイル名の変更")
         cover_action = menu.addAction("カバーにする")
         label_menu = menu.addMenu("ラベル")
@@ -4848,6 +5201,8 @@ class MainWindow(QMainWindow):
             self.open_selected_image()
         elif selected == copy_action:
             self.copy_selected_material_to_clipboard()
+        elif selected == add_new_card_action:
+            self.add_selected_material_to_new_prompt()
         elif selected == rename_action:
             self.rename_selected_image()
         elif selected == cover_action:
@@ -5442,13 +5797,13 @@ def media_type_for_path(path: Path) -> str:
 
 def media_label(media_type: str) -> str:
     return {
-        "video": "[VIDEO]",
+        "video": "*",
         "audio": "[AUDIO]",
         "archive": "[ZIP]",
         "document": "[DOC]",
         "code": "[CODE]",
         "text": "[TEXT]",
-        "file": "[FILE]",
+        "file": "",
     }.get(media_type, "")
 
 
