@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-AI Prompt Organizer v105
+AI Prompt Organizer v107
 
 AI生成用プロンプトを、タイトル・タグ・説明・画像付きで管理するローカルGUIツール。
 PySide6 + SQLite で動作します。
@@ -74,7 +74,7 @@ except Exception as exc:  # pragma: no cover - 実行環境向けメッセージ
 
 
 APP_NAME = "AI Prompt Organizer"
-APP_VERSION = "v1.25.1"
+APP_VERSION = "v1.25.3"
 APP_AUTHOR = "MF235"
 APP_CONTACT_X = "https://x.com/MF235XBR"
 APP_REPOSITORY = "https://github.com/mf235/ai-prompt-organizer"
@@ -6246,6 +6246,8 @@ class MainWindow(QMainWindow):
         ]
 
     def show_key_operations_dialog(self) -> None:
+        rows = self.key_operation_rows()
+
         dialog = QDialog(self)
         dialog.setWindowTitle("キー操作")
         dialog.setModal(True)
@@ -6265,21 +6267,22 @@ class MainWindow(QMainWindow):
 
         header_process = QLabel("処理")
         header_key = QLabel("対応キー")
+        header_process.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        header_key.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         header_process.setStyleSheet("font-weight: bold; border-bottom: 1px solid #888; padding-bottom: 4px;")
         header_key.setStyleSheet("font-weight: bold; border-bottom: 1px solid #888; padding-bottom: 4px;")
         table_layout.addWidget(header_process, 0, 0)
         table_layout.addWidget(header_key, 0, 1)
 
-        for row_index, (name, key) in enumerate(self.key_operation_rows(), start=1):
+        for row_index, (name, key) in enumerate(rows, start=1):
             process_label = QLabel(name)
             key_label = QLabel(key)
-            key_font = QFont("Consolas")
-            key_font.setStyleHint(QFont.Monospace)
-            key_label.setFont(key_font)
+            process_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            key_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
             table_layout.addWidget(process_label, row_index, 0)
             table_layout.addWidget(key_label, row_index, 1)
 
-        table_layout.setRowStretch(len(self.key_operation_rows()) + 1, 1)
+        table_layout.setRowStretch(len(rows) + 1, 1)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
