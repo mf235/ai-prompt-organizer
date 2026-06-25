@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-AI Prompt Organizer v91
+AI Prompt Organizer v102
 
 AI生成用プロンプトを、タイトル・タグ・説明・画像付きで管理するローカルGUIツール。
 PySide6 + SQLite で動作します。
@@ -24,7 +24,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Iterable, Optional
+from typing import Callable, Iterable, Optional, Sequence
 
 try:
     from PySide6.QtCore import QEvent, QLockFile, QMimeData, QPoint, QRect, QSize, Qt, QTimer, QUrl, Signal
@@ -74,7 +74,7 @@ except Exception as exc:  # pragma: no cover - 実行環境向けメッセージ
 
 
 APP_NAME = "AI Prompt Organizer"
-APP_VERSION = "v1.20.11"
+APP_VERSION = "v1.23.0"
 APP_AUTHOR = "MF235"
 APP_CONTACT_X = "https://x.com/MF235XBR"
 APP_REPOSITORY = "https://github.com/mf235/ai-prompt-organizer"
@@ -105,6 +105,9 @@ IMAGE_VIEWER_RESIZE_METHODS = [
 ]
 IMAGE_VIEWER_RESIZE_METHOD_KEYS = {key for key, _label in IMAGE_VIEWER_RESIZE_METHODS}
 DEFAULT_IMAGE_VIEWER_RESIZE_METHOD = "bicubic"
+IMAGE_VIEWER_TILE_GAP = 8
+IMAGE_VIEWER_TILE_MIN_CLIENT_WIDTH = 80
+IMAGE_VIEWER_TILE_MIN_CLIENT_HEIGHT = 60
 LEFT_TAG_FILTER_DEFAULT_HEIGHT = 260
 LEFT_TAG_FILTER_MIN_HEIGHT = 120
 LEFT_PINNED_PROMPT_MIN_HEIGHT = 0
@@ -554,6 +557,40 @@ class Database:
         cur = self.conn.cursor()
         cur.execute("SELECT * FROM prompts WHERE id = ?", (prompt_id,))
         return cur.fetchone()
+
+    def prompt_row_from_sql_row(self, row: sqlite3.Row) -> PromptRow:
+        prompt_id = int(row["id"])
+        cover_row = self.conn.execute(
+            """
+            SELECT thumbnail_path FROM images
+            WHERE prompt_id = ?
+            ORDER BY is_cover DESC, sort_order ASC, id ASC
+            LIMIT 1
+            """,
+            (prompt_id,),
+        ).fetchone()
+        return PromptRow(
+            id=prompt_id,
+            title=str(row["title"]),
+            prompt=str(row["prompt"]),
+            negative_prompt=str(row["negative_prompt"]),
+            description=str(row["description"]),
+            engine=str(row["engine"]),
+            model=str(row["model"]),
+            project=str(row["project"]),
+            rating=int(row["rating"]),
+            favorite=int(row["favorite"]),
+            pinned=int(row["pinned"]),
+            tags=self.list_prompt_tags(prompt_id),
+            cover_thumb=str(cover_row["thumbnail_path"] if cover_row else ""),
+            updated_at=str(row["updated_at"]),
+        )
+
+    def get_prompt_row(self, prompt_id: int) -> PromptRow | None:
+        row = self.get_prompt(prompt_id)
+        if row is None:
+            return None
+        return self.prompt_row_from_sql_row(row)
 
     def list_prompt_tags(self, prompt_id: int) -> list[str]:
         rows = self.conn.execute(
@@ -1646,7 +1683,7 @@ class ImageViewerWindow(QWidget):
     MODE_SCROLL = "scroll"
     MODE_LABELS = {
         MODE_FRAMELESS: "フレームレス表示",
-        MODE_SCROLL: "原寸スクロール表示",
+        MODE_SCROLL: "通常ウィンドウ表示",
     }
     RESIZE_MARGIN = 8
 
@@ -1677,6 +1714,98 @@ class ImageViewerWindow(QWidget):
         self.apply_mode(first=True)
         self.resize_to_zoom()
         self.move(self.main_window.next_viewer_position(self.size()))
+        self.install_image_viewer_shortcuts()
+
+    def set_shortcut_visible_in_context_menu(self, action: QAction) -> None:
+        setter = getattr(action, "setShortcutVisibleInContextMenu", None)
+        if callable(setter):
+            setter(True)
+
+    def install_image_viewer_shortcuts(self) -> None:
+        self.front_image_viewers_action = QAction("前面表示", self)
+        self.front_image_viewers_action.setShortcut(QKeySequence("Alt+Z"))
+        self.front_image_viewers_action.setShortcutContext(Qt.WindowShortcut)
+        self.set_shortcut_visible_in_context_menu(self.front_image_viewers_action)
+        self.front_image_viewers_action.triggered.connect(
+            lambda _checked=False: self.main_window.bring_visible_image_viewers_to_front()
+        )
+
+        self.tile_image_viewers_action = QAction("並べて表示", self)
+        self.tile_image_viewers_action.setShortcut(QKeySequence("Alt+A"))
+        self.tile_image_viewers_action.setShortcutContext(Qt.WindowShortcut)
+        self.set_shortcut_visible_in_context_menu(self.tile_image_viewers_action)
+        self.tile_image_viewers_action.triggered.connect(
+            lambda _checked=False: self.main_window.tile_visible_image_viewers(self.frameGeometry())
+        )
+
+        self.close_all_image_viewers_action = QAction("全て閉じる", self)
+        self.close_all_image_viewers_action.setShortcut(QKeySequence("Alt+X"))
+        self.close_all_image_viewers_action.setShortcutContext(Qt.WindowShortcut)
+        self.set_shortcut_visible_in_context_menu(self.close_all_image_viewers_action)
+        self.close_all_image_viewers_action.triggered.connect(
+            lambda _checked=False: self.main_window.close_all_image_viewers()
+        )
+
+        self.addAction(self.front_image_viewers_action)
+        self.addAction(self.tile_image_viewers_action)
+        self.addAction(self.close_all_image_viewers_action)
+
+    def is_image_viewer_shortcut_event(self, event) -> bool:
+        if not hasattr(event, "key") or not hasattr(event, "modifiers"):
+            return False
+        if not (event.modifiers() & Qt.AltModifier):
+            return False
+        return event.key() in (Qt.Key_Z, Qt.Key_A, Qt.Key_X)
+
+    def handle_image_viewer_shortcut_key(self, key: int) -> bool:
+        if key == Qt.Key_Z:
+            self.main_window.bring_visible_image_viewers_to_front()
+            return True
+        if key == Qt.Key_A:
+            self.main_window.tile_visible_image_viewers(self.frameGeometry())
+            return True
+        if key == Qt.Key_X:
+            self.main_window.close_all_image_viewers()
+            return True
+        return False
+
+    def handle_image_viewer_shortcut_event(self, event) -> bool:
+        if not self.is_image_viewer_shortcut_event(event):
+            return False
+        if self.handle_image_viewer_shortcut_key(event.key()):
+            event.accept()
+            return True
+        return False
+
+    def nativeEvent(self, eventType, message):  # noqa: N802 - Qt naming
+        # Windows の Alt+キーは WM_SYSKEYDOWN として処理され、
+        # メインウィンドウ最小化中は Qt の QAction / keyPressEvent まで
+        # 届かない環境がある。画像ビュアー自身のネイティブイベントでも拾う。
+        if sys.platform.startswith("win"):
+            try:
+                import ctypes
+                from ctypes import wintypes
+
+                WM_KEYDOWN = 0x0100
+                WM_SYSKEYDOWN = 0x0104
+                VK_MENU = 0x12
+                VK_Z = 0x5A
+                VK_A = 0x41
+                VK_X = 0x58
+
+                msg = wintypes.MSG.from_address(int(message))
+                if int(msg.message) in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                    vk = int(msg.wParam)
+                    if vk in (VK_Z, VK_A, VK_X) and (ctypes.windll.user32.GetAsyncKeyState(VK_MENU) & 0x8000):
+                        # lParam bit 30 = previous key state. 押しっぱなしリピートは無視。
+                        if int(msg.lParam) & (1 << 30):
+                            return True, 0
+                        qt_key = {VK_Z: Qt.Key_Z, VK_A: Qt.Key_A, VK_X: Qt.Key_X}.get(vk)
+                        if qt_key is not None and self.handle_image_viewer_shortcut_key(qt_key):
+                            return True, 0
+            except Exception:
+                pass
+        return super().nativeEvent(eventType, message)
 
     def clear_scaled_cache(self) -> None:
         self._scaled_pixmap_cache.clear()
@@ -1754,6 +1883,25 @@ class ImageViewerWindow(QWidget):
         width = max(80, frame_rect.width() - left - right)
         height = max(60, frame_rect.height() - top - bottom)
         return QRect(frame_rect.x() + left, frame_rect.y() + top, width, height)
+
+    def keep_window_frame_on_available_screen(self) -> None:
+        # 通常ウィンドウへ戻した直後は、クライアント領域が画面内でも
+        # タイトルバー／枠が作業領域外へはみ出すことがある。
+        # フレーム外枠を基準に画面内へ収め、必要ならクライアントサイズを縮める。
+        frame = QRect(self.frameGeometry())
+        if not frame.isValid():
+            frame = QRect(self.geometry())
+        left, top, right, bottom = self.frame_margins()
+        min_frame_width = IMAGE_VIEWER_TILE_MIN_CLIENT_WIDTH + left + right
+        min_frame_height = IMAGE_VIEWER_TILE_MIN_CLIENT_HEIGHT + top + bottom
+        fixed_frame = keep_rect_on_available_screens(frame, min_frame_width, min_frame_height)
+        if self.mode == self.MODE_SCROLL:
+            self.setGeometry(self.client_geometry_for_frame_rect(fixed_frame))
+        else:
+            self.setGeometry(fixed_frame)
+        self.center_image_if_needed()
+        self.update_cursor(QPoint(self.width() // 2, self.height() // 2))
+        self.update()
 
     def resize_to_zoom(self, clamp_to_screen: bool = True) -> None:
         desired = self.image_size_at_zoom()
@@ -1839,7 +1987,7 @@ class ImageViewerWindow(QWidget):
             return
         available = self.available_rect()
         if self.mode == self.MODE_SCROLL:
-            # 原寸スクロール表示では、画像ではなくウィンドウ外枠を作業領域へ合わせる。
+            # 通常ウィンドウ表示では、画像ではなくウィンドウ外枠を作業領域へ合わせる。
             # 通常ウィンドウはタイトルバー／枠があるため、クライアント領域をその分だけ内側に置く。
             self.setGeometry(self.client_geometry_for_frame_rect(available))
         else:
@@ -1866,11 +2014,9 @@ class ImageViewerWindow(QWidget):
         scroll_action = QAction(self.MODE_LABELS[self.MODE_SCROLL], self)
         scroll_action.setCheckable(True)
         scroll_action.setChecked(self.mode == self.MODE_SCROLL)
-        close_all_action = QAction("全て閉じる", self)
         close_action = QAction("閉じる", self)
         frameless_action.triggered.connect(lambda: self.switch_mode(self.MODE_FRAMELESS))
         scroll_action.triggered.connect(lambda: self.switch_mode(self.MODE_SCROLL))
-        close_all_action.triggered.connect(self.main_window.close_all_image_viewers)
         close_action.triggered.connect(self.close)
         menu.addAction(frameless_action)
         menu.addAction(scroll_action)
@@ -1883,12 +2029,17 @@ class ImageViewerWindow(QWidget):
         add_menu.addAction(add_current_action)
         add_menu.addAction(add_new_action)
         menu.addSeparator()
-        menu.addAction(close_all_action)
+        menu.addAction(self.front_image_viewers_action)
+        menu.addAction(self.tile_image_viewers_action)
+        menu.addAction(self.close_all_image_viewers_action)
+        menu.addSeparator()
         menu.addAction(close_action)
         global_pos = event.globalPosition().toPoint() if hasattr(event, "globalPosition") else event.globalPos()
         menu.exec(global_pos)
 
     def keyPressEvent(self, event):  # noqa: N802 - Qt naming
+        if self.handle_image_viewer_shortcut_event(event):
+            return
         if event.key() == Qt.Key_Escape:
             self.close()
             return
@@ -2071,6 +2222,322 @@ class ImageViewerWindow(QWidget):
         self.main_window.save_image_viewer_position(self.pos())
         self.main_window.unregister_image_viewer(self)
         super().closeEvent(event)
+
+
+@dataclass(frozen=True)
+class ViewerTileRect:
+    x: float
+    y: float
+    w: float
+    h: float
+
+
+@dataclass(frozen=True)
+class ViewerTileItem:
+    viewer: ImageViewerWindow
+    src_w: int
+    src_h: int
+    frame_extra_w: int
+    frame_extra_h: int
+    client_w: float
+    client_h: float
+    w: float
+    h: float
+
+
+@dataclass(frozen=True)
+class PlacedViewerTile:
+    item: ViewerTileItem
+    rect: ViewerTileRect
+
+
+def viewer_tile_area(rect: ViewerTileRect) -> float:
+    return max(0.0, rect.w) * max(0.0, rect.h)
+
+
+def viewer_tile_contains(a: ViewerTileRect, b: ViewerTileRect) -> bool:
+    return (
+        b.x >= a.x
+        and b.y >= a.y
+        and b.x + b.w <= a.x + a.w
+        and b.y + b.h <= a.y + a.h
+    )
+
+
+def viewer_tile_intersects(a: ViewerTileRect, b: ViewerTileRect) -> bool:
+    return not (
+        b.x >= a.x + a.w
+        or b.x + b.w <= a.x
+        or b.y >= a.y + a.h
+        or b.y + b.h <= a.y
+    )
+
+
+def split_viewer_free_rect(free: ViewerTileRect, used: ViewerTileRect) -> list[ViewerTileRect]:
+    if not viewer_tile_intersects(free, used):
+        return [free]
+
+    result: list[ViewerTileRect] = []
+    if used.x > free.x:
+        result.append(ViewerTileRect(free.x, free.y, used.x - free.x, free.h))
+    if used.x + used.w < free.x + free.w:
+        result.append(
+            ViewerTileRect(
+                used.x + used.w,
+                free.y,
+                free.x + free.w - (used.x + used.w),
+                free.h,
+            )
+        )
+    if used.y > free.y:
+        result.append(ViewerTileRect(free.x, free.y, free.w, used.y - free.y))
+    if used.y + used.h < free.y + free.h:
+        result.append(
+            ViewerTileRect(
+                free.x,
+                used.y + used.h,
+                free.w,
+                free.y + free.h - (used.y + used.h),
+            )
+        )
+    return [rect for rect in result if rect.w > 0 and rect.h > 0]
+
+
+def prune_viewer_free_rects(free_rects: list[ViewerTileRect]) -> list[ViewerTileRect]:
+    pruned: list[ViewerTileRect] = []
+    for i, rect in enumerate(free_rects):
+        if any(i != j and viewer_tile_contains(other, rect) for j, other in enumerate(free_rects)):
+            continue
+        pruned.append(rect)
+    return pruned
+
+
+def score_viewer_bssf(free: ViewerTileRect, w: float, h: float) -> tuple[float, float, float]:
+    leftover_w = free.w - w
+    leftover_h = free.h - h
+    return (min(leftover_w, leftover_h), max(leftover_w, leftover_h), free.y)
+
+
+def score_viewer_baf(free: ViewerTileRect, w: float, h: float) -> tuple[float, float, float]:
+    return (viewer_tile_area(free) - w * h, min(free.w - w, free.h - h), free.y)
+
+
+def score_viewer_bl(free: ViewerTileRect, w: float, h: float) -> tuple[float, float, float]:
+    return (free.y + h, free.x, viewer_tile_area(free) - w * h)
+
+
+def pack_viewers_maxrects(
+    items: Sequence[ViewerTileItem],
+    area_w: int,
+    area_h: int,
+    score_func: Callable[[ViewerTileRect, float, float], tuple[float, float, float]],
+) -> Optional[list[PlacedViewerTile]]:
+    free_rects: list[ViewerTileRect] = [ViewerTileRect(0, 0, float(area_w), float(area_h))]
+    placed: list[PlacedViewerTile] = []
+
+    for item in items:
+        need_w = item.w + IMAGE_VIEWER_TILE_GAP
+        need_h = item.h + IMAGE_VIEWER_TILE_GAP
+        best: Optional[tuple[tuple[float, float, float], ViewerTileRect]] = None
+        for free in free_rects:
+            if need_w <= free.w and need_h <= free.h:
+                score = score_func(free, need_w, need_h)
+                if best is None or score < best[0]:
+                    best = (score, ViewerTileRect(free.x, free.y, need_w, need_h))
+        if best is None:
+            return None
+
+        used = best[1]
+        placed.append(PlacedViewerTile(item, ViewerTileRect(used.x, used.y, item.w, item.h)))
+        next_free: list[ViewerTileRect] = []
+        for free in free_rects:
+            next_free.extend(split_viewer_free_rect(free, used))
+        free_rects = prune_viewer_free_rects(next_free)
+
+    return placed
+
+
+def pack_viewers_shelf(items: Sequence[ViewerTileItem], area_w: int, area_h: int) -> Optional[list[PlacedViewerTile]]:
+    shelves: list[dict[str, float]] = []
+    placed: list[PlacedViewerTile] = []
+
+    for item in items:
+        need_w = item.w + IMAGE_VIEWER_TILE_GAP
+        need_h = item.h + IMAGE_VIEWER_TILE_GAP
+        if need_w > area_w or need_h > area_h:
+            return None
+
+        best_shelf: Optional[dict[str, float]] = None
+        best_waste: Optional[float] = None
+        for shelf in shelves:
+            if shelf["used_w"] + need_w <= area_w and need_h <= shelf["h"]:
+                waste = shelf["h"] - need_h
+                if best_waste is None or waste < best_waste:
+                    best_waste = waste
+                    best_shelf = shelf
+
+        if best_shelf is None:
+            y = 0.0 if not shelves else max(shelf["y"] + shelf["h"] for shelf in shelves)
+            if y + need_h > area_h:
+                return None
+            best_shelf = {"y": y, "h": need_h, "used_w": 0.0}
+            shelves.append(best_shelf)
+
+        x = best_shelf["used_w"]
+        y = best_shelf["y"]
+        placed.append(PlacedViewerTile(item, ViewerTileRect(x, y, item.w, item.h)))
+        best_shelf["used_w"] += need_w
+
+    return placed
+
+
+def viewer_layout_bounds(layout: Sequence[PlacedViewerTile]) -> tuple[float, float, float, float]:
+    min_x = min(placed.rect.x for placed in layout)
+    min_y = min(placed.rect.y for placed in layout)
+    max_x = max(placed.rect.x + placed.rect.w for placed in layout)
+    max_y = max(placed.rect.y + placed.rect.h for placed in layout)
+    return min_x, min_y, max_x, max_y
+
+
+def make_scaled_viewer_items(viewers: Sequence[ImageViewerWindow], scale: float) -> list[ViewerTileItem]:
+    items: list[ViewerTileItem] = []
+    for viewer in viewers:
+        if viewer.pixmap.isNull():
+            continue
+        src_w = max(1, viewer.pixmap.width())
+        src_h = max(1, viewer.pixmap.height())
+        left, top, right, bottom = viewer.frame_margins()
+        extra_w = max(0, int(left + right))
+        extra_h = max(0, int(top + bottom))
+        effective_scale = max(
+            float(scale),
+            IMAGE_VIEWER_TILE_MIN_CLIENT_WIDTH / src_w,
+            IMAGE_VIEWER_TILE_MIN_CLIENT_HEIGHT / src_h,
+        )
+        client_w = src_w * effective_scale
+        client_h = src_h * effective_scale
+        items.append(
+            ViewerTileItem(
+                viewer=viewer,
+                src_w=src_w,
+                src_h=src_h,
+                frame_extra_w=extra_w,
+                frame_extra_h=extra_h,
+                client_w=client_w,
+                client_h=client_h,
+                w=client_w + extra_w,
+                h=client_h + extra_h,
+            )
+        )
+    return items
+
+
+def ordered_viewer_tile_items(items: Sequence[ViewerTileItem]) -> Iterable[list[ViewerTileItem]]:
+    key_funcs = [
+        lambda item: item.w * item.h,
+        lambda item: max(item.w, item.h),
+        lambda item: item.h,
+        lambda item: item.w,
+        lambda item: abs(item.w - item.h),
+        lambda item: item.w / max(item.h, 1.0),
+        lambda item: item.h / max(item.w, 1.0),
+    ]
+    seen: set[tuple[int, ...]] = set()
+    for key_func in key_funcs:
+        ordered = sorted(items, key=key_func, reverse=True)
+        signature = tuple(id(item.viewer) for item in ordered)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        yield ordered
+
+
+def try_pack_viewer_tiles(viewers: Sequence[ImageViewerWindow], area_w: int, area_h: int, scale: float) -> Optional[list[PlacedViewerTile]]:
+    items = make_scaled_viewer_items(viewers, scale)
+    if not items:
+        return []
+    if any(item.w + IMAGE_VIEWER_TILE_GAP > area_w or item.h + IMAGE_VIEWER_TILE_GAP > area_h for item in items):
+        return None
+
+    packers = [
+        lambda ordered: pack_viewers_maxrects(ordered, area_w, area_h, score_viewer_bssf),
+        lambda ordered: pack_viewers_maxrects(ordered, area_w, area_h, score_viewer_baf),
+        lambda ordered: pack_viewers_maxrects(ordered, area_w, area_h, score_viewer_bl),
+        lambda ordered: pack_viewers_shelf(ordered, area_w, area_h),
+    ]
+
+    best_layout: Optional[list[PlacedViewerTile]] = None
+    best_score: Optional[tuple[float, float, float]] = None
+    for ordered in ordered_viewer_tile_items(items):
+        for packer in packers:
+            layout = packer(ordered)
+            if layout is None:
+                continue
+            _min_x, _min_y, max_x, max_y = viewer_layout_bounds(layout)
+            score = (max_x * max_y, max_y, max_x)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_layout = layout
+    return best_layout
+
+
+def calculate_best_viewer_tile_layout(viewers: Sequence[ImageViewerWindow], available: QRect) -> list[tuple[ImageViewerWindow, QRect]]:
+    visible_viewers = [viewer for viewer in viewers if viewer.isVisible() and not viewer.pixmap.isNull()]
+    if not visible_viewers or available.width() <= 0 or available.height() <= 0:
+        return []
+
+    area_w = max(1, available.width())
+    area_h = max(1, available.height())
+    total_image_area = sum(max(1, viewer.pixmap.width()) * max(1, viewer.pixmap.height()) for viewer in visible_viewers)
+    if total_image_area <= 0:
+        return []
+
+    single_high_values: list[float] = []
+    for viewer in visible_viewers:
+        left, top, right, bottom = viewer.frame_margins()
+        extra_w = max(0, int(left + right))
+        extra_h = max(0, int(top + bottom))
+        src_w = max(1, viewer.pixmap.width())
+        src_h = max(1, viewer.pixmap.height())
+        if area_w <= extra_w or area_h <= extra_h:
+            return []
+        single_high_values.append(min((area_w - extra_w) / src_w, (area_h - extra_h) / src_h))
+
+    single_high = min(single_high_values)
+    area_high = (area_w * area_h / total_image_area) ** 0.5
+    high = max(0.01, min(single_high, area_high) * 1.05)
+    low = 0.01
+    best_layout: Optional[list[PlacedViewerTile]] = None
+
+    for _ in range(45):
+        mid = (low + high) / 2.0
+        layout = try_pack_viewer_tiles(visible_viewers, area_w, area_h, mid)
+        if layout is not None:
+            best_layout = layout
+            low = mid
+        else:
+            high = mid
+
+    if not best_layout:
+        return []
+
+    min_x, min_y, max_x, max_y = viewer_layout_bounds(best_layout)
+    used_w = max_x - min_x
+    used_h = max_y - min_y
+    offset_x = available.x() + (area_w - used_w) / 2.0 - min_x
+    offset_y = available.y() + (area_h - used_h) / 2.0 - min_y
+
+    result: list[tuple[ImageViewerWindow, QRect]] = []
+    for placed in best_layout:
+        rect = placed.rect
+        frame_rect = QRect(
+            int(round(rect.x + offset_x)),
+            int(round(rect.y + offset_y)),
+            max(1, int(round(rect.w))),
+            max(1, int(round(rect.h))),
+        )
+        result.append((placed.item.viewer, frame_rect))
+    return result
 
 
 class CollapsibleGroupBox(QGroupBox):
@@ -2729,7 +3196,34 @@ class MainWindow(QMainWindow):
             current = parent
         return False
 
+    def image_viewer_for_event_target(self, obj) -> Optional[ImageViewerWindow]:
+        current = obj
+        while current is not None:
+            if isinstance(current, ImageViewerWindow):
+                return current
+            parent = current.parent() if hasattr(current, "parent") else None
+            if parent is current:
+                break
+            current = parent
+        active = QApplication.activeWindow()
+        if isinstance(active, ImageViewerWindow):
+            return active
+        return None
+
     def eventFilter(self, obj, event):  # noqa: N802 - Qt naming
+        if event.type() == QEvent.ShortcutOverride:
+            viewer = self.image_viewer_for_event_target(obj)
+            if viewer is not None and viewer.isVisible() and viewer.is_image_viewer_shortcut_event(event):
+                # Alt+キーがメニューバー処理へ吸われないようにする。
+                # 実行は後続の KeyPress / nativeEvent 側で行う。
+                event.accept()
+                return False
+
+        if event.type() == QEvent.KeyPress:
+            viewer = self.image_viewer_for_event_target(obj)
+            if viewer is not None and viewer.isVisible() and viewer.handle_image_viewer_shortcut_event(event):
+                return True
+
         if event.type() in (QEvent.DragEnter, QEvent.DragMove, QEvent.Drop):
             mime_data = event.mimeData() if hasattr(event, "mimeData") else None
             if mime_data is not None and mime_data.hasFormat(INTERNAL_MATERIAL_DRAG_MIME) and self.is_text_drop_target(obj):
@@ -2905,7 +3399,7 @@ class MainWindow(QMainWindow):
         self.tag_filter_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored)
         tag_layout.addWidget(self.tag_filter_scroll, 1)
         tag_btn_row = QHBoxLayout()
-        self.clear_tags_button = QPushButton("解除")
+        self.clear_tags_button = QPushButton("解除/再読み込み")
         self.only_favorite_checkbox = QCheckBox("お気に入りのみ")
         tag_btn_row.addWidget(self.clear_tags_button)
         tag_btn_row.addWidget(self.only_favorite_checkbox)
@@ -3153,6 +3647,29 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(copy_prompt_action)
         edit_menu.addAction(copy_full_action)
 
+        view_menu = self.menuBar().addMenu("表示")
+        image_viewer_menu = view_menu.addMenu("画像ビュアー")
+
+        bring_image_viewers_front_action = QAction("前面表示", self)
+        bring_image_viewers_front_action.setShortcut(QKeySequence("Alt+Z"))
+        bring_image_viewers_front_action.setShortcutContext(Qt.ApplicationShortcut)
+        bring_image_viewers_front_action.triggered.connect(lambda _checked=False: self.bring_visible_image_viewers_to_front())
+
+        tile_image_viewers_action = QAction("並べて表示", self)
+        tile_image_viewers_action.setShortcut(QKeySequence("Alt+A"))
+        tile_image_viewers_action.setShortcutContext(Qt.ApplicationShortcut)
+        tile_image_viewers_action.triggered.connect(lambda _checked=False: self.tile_visible_image_viewers())
+
+        close_image_viewers_action = QAction("全て閉じる", self)
+        close_image_viewers_action.setShortcut(QKeySequence("Alt+X"))
+        close_image_viewers_action.setShortcutContext(Qt.ApplicationShortcut)
+        close_image_viewers_action.triggered.connect(self.close_all_image_viewers)
+
+        image_viewer_menu.addAction(bring_image_viewers_front_action)
+        image_viewer_menu.addAction(tile_image_viewers_action)
+        image_viewer_menu.addSeparator()
+        image_viewer_menu.addAction(close_image_viewers_action)
+
         settings_menu = self.menuBar().addMenu("設定")
         self.resident_mode_action = QAction("常駐モード", self)
         self.resident_mode_action.setCheckable(True)
@@ -3208,8 +3725,15 @@ class MainWindow(QMainWindow):
         self.set_image_viewer_resize_method(self.image_viewer_resize_method, save=False)
 
         help_menu = self.menuBar().addMenu("ヘルプ")
+        readme_action = QAction("readme.txt", self)
+        readme_action.triggered.connect(self.open_readme_file)
+        key_help_action = QAction("キー操作", self)
+        key_help_action.triggered.connect(self.show_key_operations_dialog)
         about_action = QAction("バージョン情報", self)
         about_action.triggered.connect(self.show_about_dialog)
+        help_menu.addAction(readme_action)
+        help_menu.addAction(key_help_action)
+        help_menu.addSeparator()
         help_menu.addAction(about_action)
 
     def setup_tray_icon(self) -> None:
@@ -3835,8 +4359,7 @@ class MainWindow(QMainWindow):
         ).lower()
         return not query or query in haystack
 
-    def add_prompt_row_to_list(self, target_list: QListWidget, row: PromptRow) -> None:
-        item = QListWidgetItem()
+    def setup_prompt_list_item(self, item: QListWidgetItem, row: PromptRow) -> None:
         # The visible row is drawn by PromptListItemWidget.
         # Keep the QListWidgetItem display text empty so Qt's default item text
         # does not bleed into the reserved thumbnail area behind the custom widget.
@@ -3845,10 +4368,86 @@ class MainWindow(QMainWindow):
         item.setData(Qt.UserRole + 1, row.title or "(無題)")
         item.setData(Qt.UserRole + 2, row.pinned)
         item.setToolTip(f"更新: {row.updated_at}\nタグ: {', '.join(row.tags)}")
+
+    def add_prompt_row_to_list(self, target_list: QListWidget, row: PromptRow) -> None:
+        item = QListWidgetItem()
+        self.setup_prompt_list_item(item, row)
         widget = PromptListItemWidget(row, QSize(72, 72))
         item.setSizeHint(widget.sizeHint())
         target_list.addItem(item)
         target_list.setItemWidget(item, widget)
+
+    def find_prompt_item_in_visible_lists(self, prompt_id: int) -> tuple[QListWidget | None, QListWidgetItem | None]:
+        for target_list in (self.pinned_prompt_list, self.prompt_list):
+            for index in range(target_list.count()):
+                item = target_list.item(index)
+                if item is not None and int(item.data(Qt.UserRole)) == int(prompt_id):
+                    return target_list, item
+        return None, None
+
+    def update_prompt_list_item_in_place(self, target_list: QListWidget, item: QListWidgetItem, row: PromptRow) -> None:
+        old_widget = target_list.itemWidget(item)
+        if old_widget is not None:
+            target_list.removeItemWidget(item)
+            old_widget.deleteLater()
+        self.setup_prompt_list_item(item, row)
+        widget = PromptListItemWidget(row, QSize(72, 72))
+        item.setSizeHint(widget.sizeHint())
+        target_list.setItemWidget(item, widget)
+
+    def remove_prompt_item_from_list(self, target_list: QListWidget, item: QListWidgetItem) -> None:
+        row_index = target_list.row(item)
+        if row_index < 0:
+            return
+        old_widget = target_list.itemWidget(item)
+        if old_widget is not None:
+            target_list.removeItemWidget(item)
+            old_widget.deleteLater()
+        removed_item = target_list.takeItem(row_index)
+        del removed_item
+
+    def update_saved_prompt_in_visible_list(self, prompt_id: int, add_missing: bool = True) -> bool:
+        row = self.db.get_prompt_row(prompt_id)
+        if row is None:
+            return False
+
+        query = self.search_edit.text().strip().lower()
+        selected_tags = set(self.selected_filter_tags())
+        only_fav = self.only_favorite_checkbox.isChecked()
+        should_show_normal = self.prompt_row_matches_filters(row, query, selected_tags, only_fav)
+        target_list, item = self.find_prompt_item_in_visible_lists(prompt_id)
+
+        self._prompt_selection_syncing = True
+        self.prompt_list.blockSignals(True)
+        self.pinned_prompt_list.blockSignals(True)
+        try:
+            if row.pinned:
+                if target_list is self.pinned_prompt_list and item is not None:
+                    self.update_prompt_list_item_in_place(target_list, item, row)
+                elif add_missing:
+                    if target_list is not None and item is not None:
+                        self.remove_prompt_item_from_list(target_list, item)
+                    self.add_prompt_row_to_list(self.pinned_prompt_list, row)
+                return True
+
+            if should_show_normal:
+                if target_list is self.prompt_list and item is not None:
+                    self.update_prompt_list_item_in_place(target_list, item, row)
+                elif add_missing:
+                    if target_list is not None and item is not None:
+                        self.remove_prompt_item_from_list(target_list, item)
+                    self.add_prompt_row_to_list(self.prompt_list, row)
+                return True
+
+            if target_list is not None and item is not None:
+                self.remove_prompt_item_from_list(target_list, item)
+            return False
+        finally:
+            self.prompt_list.blockSignals(False)
+            self.pinned_prompt_list.blockSignals(False)
+            self._prompt_selection_syncing = False
+            self.update_pinned_prompt_area_height()
+            self.schedule_pinned_prompt_area_update()
 
     def schedule_pinned_prompt_area_update(self) -> None:
         if getattr(self, "_pending_pinned_area_update", False):
@@ -3986,11 +4585,39 @@ class MainWindow(QMainWindow):
             self.save_current_prompt()
         return True
 
+    def restore_prompt_selection_without_loading(self, prompt_id: int | None) -> None:
+        if prompt_id is None:
+            return
+        target_list, item = self.find_prompt_item_in_visible_lists(int(prompt_id))
+        self._prompt_selection_syncing = True
+        self.prompt_list.blockSignals(True)
+        self.pinned_prompt_list.blockSignals(True)
+        try:
+            self.prompt_list.setCurrentItem(None)
+            self.prompt_list.clearSelection()
+            self.pinned_prompt_list.setCurrentItem(None)
+            self.pinned_prompt_list.clearSelection()
+            if target_list is not None and item is not None:
+                target_list.setCurrentItem(item)
+                item.setSelected(True)
+        finally:
+            self.prompt_list.blockSignals(False)
+            self.pinned_prompt_list.blockSignals(False)
+            self._prompt_selection_syncing = False
+
     def on_prompt_selected(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
         if self._prompt_selection_syncing:
             return
         if current is None:
             return
+        prompt_id = int(current.data(Qt.UserRole))
+        if self.current_prompt_id is not None and prompt_id == int(self.current_prompt_id):
+            return
+        previous_prompt_id = self.current_prompt_id
+        if not self.maybe_save_dirty():
+            self.restore_prompt_selection_without_loading(previous_prompt_id)
+            return
+
         sender = self.sender()
         other_list: QListWidget | None = None
         if sender is self.pinned_prompt_list:
@@ -4002,7 +4629,6 @@ class MainWindow(QMainWindow):
             other_list.setCurrentItem(None)
             other_list.clearSelection()
             other_list.blockSignals(False)
-        prompt_id = int(current.data(Qt.UserRole))
         self.load_prompt(prompt_id)
 
     def clear_detail(self) -> None:
@@ -4064,7 +4690,8 @@ class MainWindow(QMainWindow):
 
     def save_current_prompt(self) -> None:
         data = self.gather_current_data()
-        if self.current_prompt_id is None:
+        created_new = self.current_prompt_id is None
+        if created_new:
             self.current_prompt_id = self.db.create_prompt(**data)
         else:
             self.db.update_prompt(self.current_prompt_id, data)
@@ -4074,9 +4701,17 @@ class MainWindow(QMainWindow):
         self.refresh_tags()
         self.reload_preset_combo()
         self.reload_meta_combos()
-        self.refresh_prompt_list()
-        self.select_prompt_in_list(self.current_prompt_id)
-        self.statusBar().showMessage("保存しました")
+        if created_new:
+            self.refresh_prompt_list()
+            self.select_prompt_in_list(self.current_prompt_id)
+            self.statusBar().showMessage("保存しました")
+            return
+
+        still_visible = self.update_saved_prompt_in_visible_list(self.current_prompt_id)
+        if still_visible:
+            self.statusBar().showMessage("保存しました")
+        else:
+            self.statusBar().showMessage("保存しました。現在の絞り込み条件から外れたため一覧から非表示にしました")
 
     def select_prompt_in_list(self, prompt_id: int) -> None:
         self._prompt_selection_syncing = True
@@ -4501,8 +5136,8 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 QMessageBox.warning(self, "素材追加エラー", f"素材を追加できませんでした。\n{src}\n\n{exc}")
         if added:
-            self.refresh_images()
-            self.refresh_prompt_list()
+            self.refresh_images(sync_assets=False)
+            self.update_saved_prompt_in_visible_list(self.current_prompt_id, add_missing=False)
             self.statusBar().showMessage(f"素材を {added} 件追加しました")
 
     def ask_video_import_mode(self, src: Path, allow_apply_all: bool = False) -> tuple[Optional[str], bool]:
@@ -4947,6 +5582,17 @@ class MainWindow(QMainWindow):
         path = Path(str(row["file_path"] or ""))
         return path if path.exists() else None
 
+    def material_path_for_image_id(self, image_id) -> Optional[Path]:
+        try:
+            image_id = int(image_id)
+        except Exception:
+            return None
+        row = self.db.get_image(image_id)
+        if not row:
+            return None
+        path = Path(str(row["file_path"] or ""))
+        return path if path.exists() else None
+
     def selected_material_drag_pixmap(self) -> Optional[QPixmap]:
         image_id = self.selected_image_id()
         if image_id is None:
@@ -4963,7 +5609,9 @@ class MainWindow(QMainWindow):
             self.drop_hint_label.setText("画像/動画/ファイルをここへドラッグ＆ドロップで追加できます。")
             return
         file_name = str(current.data(Qt.UserRole + 1) or current.text())
-        self.drop_hint_label.setText(file_name)
+        image_id = current.data(Qt.UserRole)
+        detail = material_file_detail_text(file_name, self.material_path_for_image_id(image_id))
+        self.drop_hint_label.setText(detail)
 
     def reload_current_materials(self) -> None:
         if self.current_prompt_id is None:
@@ -5285,6 +5933,10 @@ class MainWindow(QMainWindow):
             viewer.center_image_if_needed()
         self.image_viewers.append(viewer)
         viewer.showNormal()
+        if mode == ImageViewerWindow.MODE_SCROLL:
+            viewer.keep_window_frame_on_available_screen()
+            QTimer.singleShot(0, lambda v=viewer: v.keep_window_frame_on_available_screen() if v.isVisible() else None)
+            QTimer.singleShot(120, lambda v=viewer: v.keep_window_frame_on_available_screen() if v.isVisible() else None)
         self.force_activate_widget(viewer)
         QTimer.singleShot(0, viewer.showNormal)
         QTimer.singleShot(0, lambda v=viewer: self.force_activate_widget(v) if v.isVisible() else None)
@@ -5296,6 +5948,69 @@ class MainWindow(QMainWindow):
     def close_all_image_viewers(self) -> None:
         for viewer in list(self.image_viewers):
             viewer.close()
+
+    def visible_image_viewers(self) -> list[ImageViewerWindow]:
+        viewers = [viewer for viewer in list(self.image_viewers) if viewer.isVisible()]
+        if len(viewers) != len(self.image_viewers):
+            self.image_viewers = viewers
+        return viewers
+
+    def bring_visible_image_viewers_to_front(self) -> None:
+        viewers = self.visible_image_viewers()
+        if not viewers:
+            self.statusBar().showMessage("表示中の画像ウィンドウはありません")
+            return
+        for viewer in viewers:
+            viewer.showNormal()
+            self.force_activate_widget(viewer)
+        self.statusBar().showMessage(f"表示中の画像ウィンドウを前面に出しました: {len(viewers)}件")
+
+    def tile_visible_image_viewers(self, anchor_rect: Optional[QRect] = None) -> None:
+        viewers = self.visible_image_viewers()
+        if not viewers:
+            self.statusBar().showMessage("表示中の画像ウィンドウはありません")
+            return
+
+        if anchor_rect is None:
+            if self.isVisible():
+                anchor_rect = self.frameGeometry()
+            else:
+                active_window = QApplication.activeWindow()
+                if isinstance(active_window, ImageViewerWindow):
+                    anchor_rect = active_window.frameGeometry()
+                else:
+                    anchor_rect = viewers[0].frameGeometry()
+        available = best_available_geometry_for_rect(anchor_rect)
+        if len(viewers) == 1:
+            viewer = viewers[0]
+            viewer.fit_to_screen_center()
+            self.force_activate_widget(viewer)
+            self.statusBar().showMessage("表示中の画像ウィンドウを画面内へ配置しました")
+            return
+
+        layout = calculate_best_viewer_tile_layout(viewers, available)
+        if not layout:
+            self.statusBar().showMessage("画像ウィンドウの並べ替えに失敗しました")
+            return
+
+        for viewer, frame_rect in layout:
+            frame_rect = keep_rect_on_available_screens(frame_rect, IMAGE_VIEWER_TILE_MIN_CLIENT_WIDTH, IMAGE_VIEWER_TILE_MIN_CLIENT_HEIGHT)
+            if viewer.mode == ImageViewerWindow.MODE_SCROLL:
+                viewer.setGeometry(viewer.client_geometry_for_frame_rect(frame_rect))
+            else:
+                viewer.setGeometry(frame_rect)
+            if not viewer.pixmap.isNull():
+                zoom_from_width = viewer.width() * 100.0 / max(1, viewer.pixmap.width())
+                zoom_from_height = viewer.height() * 100.0 / max(1, viewer.pixmap.height())
+                viewer.zoom_percent = max(10, min(2000, int(round(min(zoom_from_width, zoom_from_height)))))
+            viewer.offset = QPoint(0, 0)
+            viewer.center_image_if_needed()
+            viewer.update_cursor(QPoint(viewer.width() // 2, viewer.height() // 2))
+            viewer.update()
+
+        for viewer, _frame_rect in layout:
+            self.force_activate_widget(viewer)
+        self.statusBar().showMessage(f"表示中の画像ウィンドウを並べて表示しました: {len(layout)}件")
 
     def save_image_viewer_position(self, pos: QPoint) -> None:
         self.db.set_setting("image_viewer_x", str(pos.x()))
@@ -5333,6 +6048,81 @@ class MainWindow(QMainWindow):
         prompt_dir = self.prompt_asset_dir(self.current_prompt_id)
         prompt_dir.mkdir(parents=True, exist_ok=True)
         open_path(prompt_dir)
+
+    def open_readme_file(self) -> None:
+        readme_path = get_base_dir() / "readme.txt"
+        if not readme_path.exists():
+            QMessageBox.warning(self, "readme.txt", f"readme.txt が見つかりません。\n{readme_path}")
+            return
+        open_path(readme_path)
+
+    def key_operation_rows(self) -> list[tuple[str, str]]:
+        return [
+            ("保存", "Ctrl+S"),
+            ("新規", "Ctrl+N"),
+            ("検索", "Ctrl+F"),
+            ("再読み込み", "F5"),
+            ("プロンプトをコピー", "Alt+C"),
+            ("終了", "Ctrl+Q"),
+            ("メインウィンドウ表示", "Shift+Alt+A ※有効時"),
+            ("素材 ファイル名変更", "F2"),
+            ("素材 ラベル設定", "0-9"),
+            ("画像ビュアー 前面表示", "Alt+Z"),
+            ("画像ビュアー 並べて表示", "Alt+A"),
+            ("画像ビュアー 全て閉じる", "Alt+X"),
+            ("画像ビュアー 閉じる", "Esc"),
+        ]
+
+    def show_key_operations_dialog(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("キー操作")
+        dialog.setModal(True)
+        dialog.resize(520, 440)
+        layout = QVBoxLayout(dialog)
+
+        title = QLabel("キー操作")
+        title.setStyleSheet("font-weight: bold; font-size: 15px;")
+        layout.addWidget(title)
+
+        table_widget = QWidget()
+        table_layout = QGridLayout(table_widget)
+        table_layout.setContentsMargins(8, 8, 8, 8)
+        table_layout.setHorizontalSpacing(24)
+        table_layout.setVerticalSpacing(6)
+        table_layout.setColumnStretch(0, 1)
+
+        header_process = QLabel("処理")
+        header_key = QLabel("対応キー")
+        header_process.setStyleSheet("font-weight: bold; border-bottom: 1px solid #888; padding-bottom: 4px;")
+        header_key.setStyleSheet("font-weight: bold; border-bottom: 1px solid #888; padding-bottom: 4px;")
+        table_layout.addWidget(header_process, 0, 0)
+        table_layout.addWidget(header_key, 0, 1)
+
+        for row_index, (name, key) in enumerate(self.key_operation_rows(), start=1):
+            process_label = QLabel(name)
+            key_label = QLabel(key)
+            key_font = QFont("Consolas")
+            key_font.setStyleHint(QFont.Monospace)
+            key_label.setFont(key_font)
+            table_layout.addWidget(process_label, row_index, 0)
+            table_layout.addWidget(key_label, row_index, 1)
+
+        table_layout.setRowStretch(len(self.key_operation_rows()) + 1, 1)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(table_widget)
+        layout.addWidget(scroll, 1)
+
+        close_button = QPushButton("閉じる")
+        close_button.setDefault(True)
+        close_button.clicked.connect(dialog.accept)
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        button_row.addWidget(close_button)
+        layout.addLayout(button_row)
+
+        dialog.exec()
 
     def show_about_dialog(self) -> None:
         dialog = QDialog(self)
@@ -5855,6 +6645,27 @@ def media_paths_from_mime(mime_data) -> list[Path]:
         if path.is_file():
             paths.append(path)
     return paths
+
+
+def format_material_file_size(size_bytes: int) -> str:
+    size_bytes = max(0, int(size_bytes))
+    if size_bytes <= 0:
+        return "0 KB"
+    return f"{max(1, round(size_bytes / 1024)):,} KB"
+
+
+def material_file_detail_text(file_name: str, path: Optional[Path]) -> str:
+    file_name = str(file_name or "")
+    if path is None or not path.exists():
+        return file_name
+    try:
+        stat = path.stat()
+    except Exception:
+        return file_name
+    size_bytes = int(stat.st_size)
+    size_text = format_material_file_size(size_bytes)
+    modified_text = datetime.fromtimestamp(stat.st_mtime).strftime("%Y/%m/%d %H:%M:%S")
+    return f"{file_name} | {size_text} ({size_bytes:,} bytes) | {modified_text}"
 
 
 def elide_material_label(text: str, max_chars: int = 22) -> str:
