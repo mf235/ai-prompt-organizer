@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-AI Prompt Organizer v102
+AI Prompt Organizer v105
 
 AI生成用プロンプトを、タイトル・タグ・説明・画像付きで管理するローカルGUIツール。
 PySide6 + SQLite で動作します。
@@ -23,7 +23,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Callable, Iterable, Optional, Sequence
 
 try:
@@ -74,7 +74,7 @@ except Exception as exc:  # pragma: no cover - 実行環境向けメッセージ
 
 
 APP_NAME = "AI Prompt Organizer"
-APP_VERSION = "v1.23.0"
+APP_VERSION = "v1.25.1"
 APP_AUTHOR = "MF235"
 APP_CONTACT_X = "https://x.com/MF235XBR"
 APP_REPOSITORY = "https://github.com/mf235/ai-prompt-organizer"
@@ -89,7 +89,7 @@ EXE_ICON_RELATIVE = ("resources", "icons", "app.ico")
 DB_FILENAME = "prompt_organizer.db"
 INTERNAL_MATERIAL_DRAG_MIME = "application/x-ai-prompt-organizer-material-drag"
 BACKUP_DIR_NAME = "_backup"
-SUPPORTED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
+SUPPORTED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".ico", ".svg", ".tif", ".tiff", ".tga"}
 SUPPORTED_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 SUPPORTED_MEDIA_EXTS = SUPPORTED_IMAGE_EXTS | SUPPORTED_VIDEO_EXTS
 ARCHIVE_EXTS = {".zip", ".7z", ".rar", ".tar", ".gz"}
@@ -3103,6 +3103,7 @@ class MainWindow(QMainWindow):
         self.db = Database(self.db_path)
         self.run_daily_backup_if_needed()
         self.migrate_legacy_asset_layout()
+        self.migrate_material_paths_to_relative()
         self.current_prompt_id: Optional[int] = None
         self._prompt_selection_syncing = False
         self.loading = False
@@ -3291,6 +3292,104 @@ class MainWindow(QMainWindow):
         thumb_dir.mkdir(parents=True, exist_ok=True)
         return image_dir, file_dir, thumb_dir
 
+    def stored_path_to_absolute(self, value: object) -> Path:
+        raw = str(value or "").strip()
+        if not raw:
+            return Path()
+        path = Path(raw)
+        if path.is_absolute():
+            return path
+        try:
+            win_path = PureWindowsPath(raw)
+            if win_path.is_absolute():
+                return Path(raw)
+            if "\\" in raw:
+                return self.base_dir.joinpath(*win_path.parts)
+        except Exception:
+            pass
+        return self.base_dir / path
+
+    def legacy_asset_relative_candidate(self, value: object) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        candidates: list[tuple[str, ...]] = []
+        try:
+            candidates.append(tuple(Path(raw).parts))
+        except Exception:
+            pass
+        try:
+            candidates.append(tuple(PureWindowsPath(raw).parts))
+        except Exception:
+            pass
+        for parts in candidates:
+            lower_parts = [str(part).strip("\\/").lower() for part in parts]
+            for index, part in enumerate(lower_parts):
+                if part != "assets":
+                    continue
+                rel_parts = [str(part).strip("\\/") for part in parts[index:] if str(part).strip("\\/")]
+                if not rel_parts:
+                    continue
+                rel = Path(*rel_parts)
+                candidate = self.base_dir / rel
+                if candidate.exists():
+                    return rel.as_posix()
+        return ""
+
+    def absolute_path_to_stored(self, value: object) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        path = Path(raw)
+        try:
+            if not path.is_absolute():
+                win_path = PureWindowsPath(raw)
+                if not win_path.is_absolute():
+                    return Path(*win_path.parts).as_posix() if "\\" in raw else path.as_posix()
+        except Exception:
+            if not path.is_absolute():
+                return raw.replace("\\", "/")
+        try:
+            resolved = path.resolve()
+            base = self.base_dir.resolve()
+            return resolved.relative_to(base).as_posix()
+        except Exception:
+            pass
+        legacy_candidate = self.legacy_asset_relative_candidate(raw)
+        if legacy_candidate:
+            return legacy_candidate
+        return raw
+
+    def migrate_material_paths_to_relative(self) -> None:
+        rows = self.db.conn.execute("SELECT id, file_path, thumbnail_path FROM images ORDER BY id ASC").fetchall()
+        changed = False
+        for row in rows:
+            image_id = int(row["id"])
+            file_path = str(row["file_path"] or "")
+            thumb_path = str(row["thumbnail_path"] or "")
+            new_file_path = self.absolute_path_to_stored(file_path)
+            new_thumb_path = self.absolute_path_to_stored(thumb_path)
+            if new_file_path != file_path or new_thumb_path != thumb_path:
+                self.db.conn.execute(
+                    "UPDATE images SET file_path = ?, thumbnail_path = ? WHERE id = ?",
+                    (new_file_path, new_thumb_path, image_id),
+                )
+                changed = True
+        if changed:
+            self.db.conn.commit()
+
+    def prompt_row_for_display(self, row: PromptRow) -> PromptRow:
+        if row.cover_thumb:
+            row.cover_thumb = str(self.stored_path_to_absolute(row.cover_thumb))
+        return row
+
+    def material_file_path_from_row(self, row: sqlite3.Row) -> Path:
+        return self.stored_path_to_absolute(row["file_path"] if "file_path" in row.keys() else "")
+
+    def material_thumb_path_from_row(self, row: sqlite3.Row) -> Optional[Path]:
+        raw = str(row["thumbnail_path"] if "thumbnail_path" in row.keys() else "")
+        return self.stored_path_to_absolute(raw) if raw else None
+
     def migrate_legacy_asset_layout(self) -> None:
         legacy_roots = [self.legacy_images_dir, self.legacy_files_dir, self.legacy_thumbs_dir]
         if not any(path.exists() for path in legacy_roots):
@@ -3303,23 +3402,23 @@ class MainWindow(QMainWindow):
             media_type = str(row["media_type"] if "media_type" in row.keys() else "image")
             image_dir, file_dir, thumb_dir = self.ensure_prompt_asset_dirs(prompt_id)
 
-            file_path = Path(str(row["file_path"] or ""))
+            file_path = self.material_file_path_from_row(row)
             if file_path.exists():
                 target_dir = image_dir if media_type == "image" else file_dir
                 if not is_relative_to_path(file_path, target_dir):
                     try:
                         dest = unique_path(target_dir / file_path.name)
                         shutil.move(str(file_path), str(dest))
-                        self.db.update_image_file_path(image_id, str(dest))
+                        self.db.update_image_file_path(image_id, self.absolute_path_to_stored(dest))
                     except Exception:
                         pass
 
-            thumb_path = Path(str(row["thumbnail_path"] or ""))
-            if thumb_path.exists() and not is_relative_to_path(thumb_path, thumb_dir):
+            thumb_path = self.material_thumb_path_from_row(row)
+            if thumb_path and thumb_path.exists() and not is_relative_to_path(thumb_path, thumb_dir):
                 try:
                     dest = unique_path(thumb_dir / thumb_path.name)
                     shutil.move(str(thumb_path), str(dest))
-                    self.db.update_image_thumbnail(image_id, str(dest))
+                    self.db.update_image_thumbnail(image_id, self.absolute_path_to_stored(dest))
                 except Exception:
                     pass
 
@@ -3630,6 +3729,10 @@ class MainWindow(QMainWindow):
         reload_action.setShortcutContext(Qt.ApplicationShortcut)
         reload_action.triggered.connect(self.reload_current_materials)
         self.addAction(reload_action)
+        paste_material_action = QAction("クリップボードから素材へ貼り付け", self)
+        paste_material_action.setShortcut(QKeySequence("Alt+V"))
+        paste_material_action.setShortcutContext(Qt.ApplicationShortcut)
+        paste_material_action.triggered.connect(self.paste_material_from_clipboard)
         copy_prompt_action = QAction("プロンプトをコピー", self)
         copy_prompt_action.setShortcut(QKeySequence("Alt+C"))
         copy_prompt_action.setShortcutContext(Qt.ApplicationShortcut)
@@ -3643,6 +3746,8 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(delete_action)
         edit_menu.addSeparator()
         edit_menu.addAction(search_action)
+        edit_menu.addSeparator()
+        edit_menu.addAction(paste_material_action)
         edit_menu.addSeparator()
         edit_menu.addAction(copy_prompt_action)
         edit_menu.addAction(copy_full_action)
@@ -4410,6 +4515,7 @@ class MainWindow(QMainWindow):
         row = self.db.get_prompt_row(prompt_id)
         if row is None:
             return False
+        row = self.prompt_row_for_display(row)
 
         query = self.search_edit.text().strip().lower()
         selected_tags = set(self.selected_filter_tags())
@@ -4506,7 +4612,7 @@ class MainWindow(QMainWindow):
         query = self.search_edit.text().strip().lower()
         selected_tags = set(self.selected_filter_tags())
         only_fav = self.only_favorite_checkbox.isChecked()
-        rows = self.db.list_prompts()
+        rows = [self.prompt_row_for_display(row) for row in self.db.list_prompts()]
 
         self.prompt_list.blockSignals(True)
         self.pinned_prompt_list.blockSignals(True)
@@ -4817,11 +4923,11 @@ class MainWindow(QMainWindow):
         if prompt_asset_dir.exists():
             recycle_targets.append(prompt_asset_dir)
         for row in image_rows:
-            file_path = Path(str(row["file_path"]))
-            thumb_path = Path(str(row["thumbnail_path"] or ""))
+            file_path = self.material_file_path_from_row(row)
+            thumb_path = self.material_thumb_path_from_row(row)
             if file_path.exists() and not (prompt_asset_dir.exists() and is_relative_to_path(file_path, prompt_asset_dir)):
                 recycle_targets.append(file_path)
-            if thumb_path.exists() and not (prompt_asset_dir.exists() and is_relative_to_path(thumb_path, prompt_asset_dir)):
+            if thumb_path and thumb_path.exists() and not (prompt_asset_dir.exists() and is_relative_to_path(thumb_path, prompt_asset_dir)):
                 recycle_targets.append(thumb_path)
 
         self.db.delete_prompt(deleted_id)
@@ -4944,7 +5050,7 @@ class MainWindow(QMainWindow):
             self,
             "素材を選択",
             str(Path.home()),
-            "All Files (*.*);;Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif);;Videos (*.mp4 *.mov *.avi *.mkv *.webm)",
+            "All Files (*.*);;Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif *.ico *.svg *.tif *.tiff *.tga);;Videos (*.mp4 *.mov *.avi *.mkv *.webm)",
         )
         if files:
             self.add_images_from_paths([Path(f) for f in files])
@@ -4978,7 +5084,7 @@ class MainWindow(QMainWindow):
         row = self.db.get_image(image_id)
         if not row:
             return
-        src_path = Path(str(row["file_path"] or ""))
+        src_path = self.material_file_path_from_row(row)
         if not src_path.exists() or not src_path.is_file():
             QMessageBox.warning(self, "素材追加エラー", f"素材ファイルが見つかりません。\n{src_path}")
             return
@@ -5017,7 +5123,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("同じカードへの素材移動は行いませんでした")
             return False
 
-        src_path = Path(str(row["file_path"]))
+        src_path = self.material_file_path_from_row(row)
         if not src_path.exists() or not src_path.is_file():
             QMessageBox.warning(self, "素材D&Dエラー", f"素材ファイルが見つかりません。\n{src_path}")
             return False
@@ -5035,7 +5141,7 @@ class MainWindow(QMainWindow):
                 shutil.copy2(src_path, dest_path)
                 new_image_id = self.db.add_image(
                     target_prompt_id,
-                    str(dest_path),
+                    self.absolute_path_to_stored(dest_path),
                     "",
                     caption=caption,
                     media_type=media_type,
@@ -5043,18 +5149,18 @@ class MainWindow(QMainWindow):
                 )
                 thumb_path = self.create_material_thumbnail(dest_path, new_image_id, target_prompt_id, media_type)
                 if thumb_path:
-                    self.db.update_image_thumbnail(new_image_id, str(thumb_path))
+                    self.db.update_image_thumbnail(new_image_id, self.absolute_path_to_stored(thumb_path))
                 if label_id:
                     self.db.update_image_label(new_image_id, label_id)
                 message = "素材をコピーしました"
             else:
-                old_thumb_path = Path(str(row["thumbnail_path"] or ""))
+                old_thumb_path = self.material_thumb_path_from_row(row)
                 if src_path.resolve() != dest_path.resolve():
                     shutil.move(str(src_path), str(dest_path))
                 thumb_path = self.create_material_thumbnail(dest_path, image_id, target_prompt_id, media_type)
-                new_thumb_path = str(thumb_path) if thumb_path else ""
-                self.db.move_image_to_prompt(image_id, target_prompt_id, str(dest_path), new_thumb_path)
-                if old_thumb_path.exists() and (not thumb_path or old_thumb_path.resolve() != thumb_path.resolve()):
+                new_thumb_path = self.absolute_path_to_stored(thumb_path) if thumb_path else ""
+                self.db.move_image_to_prompt(image_id, target_prompt_id, self.absolute_path_to_stored(dest_path), new_thumb_path)
+                if old_thumb_path and old_thumb_path.exists() and (not thumb_path or old_thumb_path.resolve() != thumb_path.resolve()):
                     try:
                         old_thumb_path.unlink()
                     except Exception:
@@ -5071,6 +5177,69 @@ class MainWindow(QMainWindow):
         self.select_prompt_in_list(self.current_prompt_id) if self.current_prompt_id is not None else None
         self.statusBar().showMessage(message)
         return True
+
+    def clipboard_image_to_qimage(self) -> QImage:
+        clipboard = QGuiApplication.clipboard()
+        mime = clipboard.mimeData()
+        if mime is not None and mime.hasImage():
+            data = mime.imageData()
+            if isinstance(data, QImage):
+                return QImage(data)
+            if isinstance(data, QPixmap):
+                return data.toImage()
+        image = clipboard.image()
+        return QImage(image) if not image.isNull() else QImage()
+
+    def add_clipboard_image_as_material(self, image: QImage) -> bool:
+        if image.isNull():
+            return False
+        if not self.ensure_current_prompt_saved_for_images():
+            return False
+        assert self.current_prompt_id is not None
+
+        prompt_image_dir, _prompt_file_dir, _prompt_thumb_dir = self.ensure_prompt_asset_dirs(self.current_prompt_id)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        dest = unique_path(prompt_image_dir / f"clipboard_{timestamp}.png")
+        if not image.save(str(dest), "PNG"):
+            QMessageBox.warning(self, "素材貼り付けエラー", "クリップボード画像をPNGとして保存できませんでした。")
+            return False
+
+        image_id = self.db.add_image(
+            self.current_prompt_id,
+            self.absolute_path_to_stored(dest),
+            "",
+            media_type="image",
+            original_name="clipboard.png",
+        )
+        thumb_path = self.create_material_thumbnail(dest, image_id, self.current_prompt_id, "image")
+        if thumb_path:
+            self.db.update_image_thumbnail(image_id, self.absolute_path_to_stored(thumb_path))
+
+        self.refresh_images(sync_assets=False)
+        self.update_saved_prompt_in_visible_list(self.current_prompt_id, add_missing=False)
+        self.statusBar().showMessage(f"クリップボード画像を素材へ追加しました: {dest.name}")
+        return True
+
+    def paste_material_from_clipboard(self) -> None:
+        clipboard = QGuiApplication.clipboard()
+        mime = clipboard.mimeData()
+        if mime is None:
+            QMessageBox.information(self, "素材貼り付け", "クリップボードに貼り付け可能な素材がありません。")
+            return
+
+        if mime.hasUrls():
+            paths = [Path(url.toLocalFile()) for url in mime.urls() if url.isLocalFile()]
+            paths = [path for path in paths if path.exists() and path.is_file()]
+            if paths:
+                self.add_images_from_paths(paths)
+                return
+
+        image = self.clipboard_image_to_qimage()
+        if not image.isNull():
+            self.add_clipboard_image_as_material(image)
+            return
+
+        QMessageBox.information(self, "素材貼り付け", "クリップボードに貼り付け可能なファイルまたは画像がありません。")
 
     def add_images_from_paths(self, paths: Iterable[Path]) -> None:
         paths = [Path(p) for p in paths if Path(p).exists() and Path(p).is_file()]
@@ -5091,10 +5260,10 @@ class MainWindow(QMainWindow):
                     dest = unique_path(prompt_image_dir / safe_filename(src.name))
                     if src.resolve() != dest.resolve():
                         shutil.copy2(src, dest)
-                    image_id = self.db.add_image(self.current_prompt_id, str(dest), "", media_type="image", original_name=src.name)
+                    image_id = self.db.add_image(self.current_prompt_id, self.absolute_path_to_stored(dest), "", media_type="image", original_name=src.name)
                     thumb_path = self.create_material_thumbnail(dest, image_id, self.current_prompt_id, "image")
                     if thumb_path:
-                        self.db.update_image_thumbnail(image_id, str(thumb_path))
+                        self.db.update_image_thumbnail(image_id, self.absolute_path_to_stored(thumb_path))
                     added += 1
 
                 elif ext in SUPPORTED_VIDEO_EXTS:
@@ -5110,28 +5279,28 @@ class MainWindow(QMainWindow):
                         dest = unique_path(prompt_file_dir / safe_filename(src.name))
                         if src.resolve() != dest.resolve():
                             shutil.copy2(src, dest)
-                        image_id = self.db.add_image(self.current_prompt_id, str(dest), "", media_type="video", original_name=src.name)
+                        image_id = self.db.add_image(self.current_prompt_id, self.absolute_path_to_stored(dest), "", media_type="video", original_name=src.name)
                         thumb_path = self.create_material_thumbnail(dest, image_id, self.current_prompt_id, "video")
                         if not thumb_path:
                             thumb_path = self.create_material_thumbnail(dest, image_id, self.current_prompt_id, media_type_for_path(dest))
                         if thumb_path:
-                            self.db.update_image_thumbnail(image_id, str(thumb_path))
+                            self.db.update_image_thumbnail(image_id, self.absolute_path_to_stored(thumb_path))
                     else:
                         dest = self.generate_video_snapshot(src, prompt_image_dir)
-                        image_id = self.db.add_image(self.current_prompt_id, str(dest), "", media_type="image", original_name=src.name)
+                        image_id = self.db.add_image(self.current_prompt_id, self.absolute_path_to_stored(dest), "", media_type="image", original_name=src.name)
                         thumb_path = self.create_material_thumbnail(dest, image_id, self.current_prompt_id, "image")
                         if thumb_path:
-                            self.db.update_image_thumbnail(image_id, str(thumb_path))
+                            self.db.update_image_thumbnail(image_id, self.absolute_path_to_stored(thumb_path))
                     added += 1
 
                 else:
                     dest = unique_path(prompt_file_dir / safe_filename(src.name))
                     if src.resolve() != dest.resolve():
                         shutil.copy2(src, dest)
-                    image_id = self.db.add_image(self.current_prompt_id, str(dest), "", media_type=media_type_for_path(src), original_name=src.name)
+                    image_id = self.db.add_image(self.current_prompt_id, self.absolute_path_to_stored(dest), "", media_type=media_type_for_path(src), original_name=src.name)
                     thumb_path = self.create_material_thumbnail(dest, image_id, self.current_prompt_id, media_type_for_path(dest))
                     if thumb_path:
-                        self.db.update_image_thumbnail(image_id, str(thumb_path))
+                        self.db.update_image_thumbnail(image_id, self.absolute_path_to_stored(thumb_path))
                     added += 1
             except Exception as exc:
                 QMessageBox.warning(self, "素材追加エラー", f"素材を追加できませんでした。\n{src}\n\n{exc}")
@@ -5352,22 +5521,22 @@ class MainWindow(QMainWindow):
 
         for row in self.db.list_images(prompt_id):
             image_id = int(row["id"])
-            file_path = Path(str(row["file_path"] or ""))
+            file_path = self.material_file_path_from_row(row)
             if not file_path.exists():
-                thumb_path = Path(str(row["thumbnail_path"] or ""))
-                if thumb_path.exists():
+                thumb_path = self.material_thumb_path_from_row(row)
+                if thumb_path and thumb_path.exists():
                     recycle_targets.append(thumb_path)
                 self.db.delete_image(image_id)
                 changed = True
                 continue
             registered.add(material_path_key(file_path))
-            thumb_path = Path(str(row["thumbnail_path"] or ""))
-            if not thumb_path.exists():
+            thumb_path = self.material_thumb_path_from_row(row)
+            if not thumb_path or not thumb_path.exists():
                 media_type = str(row["media_type"] if "media_type" in row.keys() else media_type_for_path(file_path))
                 try:
                     new_thumb = self.create_material_thumbnail(file_path, image_id, prompt_id, media_type)
                     if new_thumb:
-                        self.db.update_image_thumbnail(image_id, str(new_thumb))
+                        self.db.update_image_thumbnail(image_id, self.absolute_path_to_stored(new_thumb))
                         changed = True
                 except Exception:
                     pass
@@ -5388,10 +5557,10 @@ class MainWindow(QMainWindow):
                     invalid_image_files.append(child.name)
                 continue
             try:
-                image_id = self.db.add_image(prompt_id, str(child), "", media_type="image", original_name=child.name)
+                image_id = self.db.add_image(prompt_id, self.absolute_path_to_stored(child), "", media_type="image", original_name=child.name)
                 thumb_path = self.create_material_thumbnail(child, image_id, prompt_id, "image")
                 if thumb_path:
-                    self.db.update_image_thumbnail(image_id, str(thumb_path))
+                    self.db.update_image_thumbnail(image_id, self.absolute_path_to_stored(thumb_path))
                 registered.add(material_path_key(child))
                 changed = True
             except Exception:
@@ -5404,15 +5573,15 @@ class MainWindow(QMainWindow):
                 continue
             try:
                 if child.suffix.lower() in SUPPORTED_VIDEO_EXTS:
-                    image_id = self.db.add_image(prompt_id, str(child), "", media_type="video", original_name=child.name)
+                    image_id = self.db.add_image(prompt_id, self.absolute_path_to_stored(child), "", media_type="video", original_name=child.name)
                     thumb_path = self.create_material_thumbnail(child, image_id, prompt_id, "video")
                     if not thumb_path:
                         thumb_path = self.create_material_thumbnail(child, image_id, prompt_id, media_type_for_path(child))
                 else:
-                    image_id = self.db.add_image(prompt_id, str(child), "", media_type=media_type_for_path(child), original_name=child.name)
+                    image_id = self.db.add_image(prompt_id, self.absolute_path_to_stored(child), "", media_type=media_type_for_path(child), original_name=child.name)
                     thumb_path = self.create_material_thumbnail(child, image_id, prompt_id, media_type_for_path(child))
                 if thumb_path:
-                    self.db.update_image_thumbnail(image_id, str(thumb_path))
+                    self.db.update_image_thumbnail(image_id, self.absolute_path_to_stored(thumb_path))
                 registered.add(material_path_key(child))
                 changed = True
             except Exception:
@@ -5491,8 +5660,10 @@ class MainWindow(QMainWindow):
 
     def add_material_list_item(self, row: sqlite3.Row) -> None:
         image_id = int(row["id"])
-        file_path = str(row["file_path"])
-        thumb_path = str(row["thumbnail_path"] or file_path)
+        file_path_obj = self.material_file_path_from_row(row)
+        thumb_path_obj = self.material_thumb_path_from_row(row)
+        file_path = str(file_path_obj)
+        thumb_path = str(thumb_path_obj or file_path_obj)
         cover = bool(row["is_cover"])
         label_id = int(row["label_id"] if "label_id" in row.keys() else 0)
         media_type = str(row["media_type"] if "media_type" in row.keys() else "image")
@@ -5579,7 +5750,7 @@ class MainWindow(QMainWindow):
         row = self.db.get_image(image_id)
         if not row:
             return None
-        path = Path(str(row["file_path"] or ""))
+        path = self.material_file_path_from_row(row)
         return path if path.exists() else None
 
     def material_path_for_image_id(self, image_id) -> Optional[Path]:
@@ -5590,7 +5761,7 @@ class MainWindow(QMainWindow):
         row = self.db.get_image(image_id)
         if not row:
             return None
-        path = Path(str(row["file_path"] or ""))
+        path = self.material_file_path_from_row(row)
         return path if path.exists() else None
 
     def selected_material_drag_pixmap(self) -> Optional[QPixmap]:
@@ -5600,8 +5771,8 @@ class MainWindow(QMainWindow):
         row = self.db.get_image(image_id)
         if not row:
             return None
-        thumb_path = str(row["thumbnail_path"] or row["file_path"] or "")
-        pix = pixmap_from_path(thumb_path, QSize(96, 72))
+        thumb_path = self.material_thumb_path_from_row(row) or self.material_file_path_from_row(row)
+        pix = pixmap_from_path(str(thumb_path), QSize(96, 72))
         return pix
 
     def on_material_selected(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
@@ -5667,17 +5838,17 @@ class MainWindow(QMainWindow):
         end_index = min(total, self._thumb_rebuild_index + self.thumbnail_rebuild_chunk_size)
         for row in self._thumb_rebuild_rows[self._thumb_rebuild_index:end_index]:
             image_id = int(row["id"])
-            file_path = Path(str(row["file_path"] or ""))
+            file_path = self.material_file_path_from_row(row)
             if not file_path.exists():
                 continue
-            old_thumb = Path(str(row["thumbnail_path"] or ""))
+            old_thumb = self.material_thumb_path_from_row(row)
             media_type = str(row["media_type"] if "media_type" in row.keys() else media_type_for_path(file_path))
             try:
                 new_thumb = self.create_material_thumbnail(file_path, image_id, prompt_id, media_type)
                 if not new_thumb:
                     raise RuntimeError("サムネを作成できませんでした。")
-                self.db.update_image_thumbnail(image_id, str(new_thumb))
-                if old_thumb.exists() and old_thumb.resolve() != new_thumb.resolve():
+                self.db.update_image_thumbnail(image_id, self.absolute_path_to_stored(new_thumb))
+                if old_thumb and old_thumb.exists() and old_thumb.resolve() != new_thumb.resolve():
                     self._thumb_rebuild_old_thumbs.append(old_thumb)
                 self._thumb_rebuild_count += 1
             except Exception as exc:
@@ -5715,7 +5886,7 @@ class MainWindow(QMainWindow):
         row = self.db.get_image(image_id)
         if not row:
             return
-        old_path = Path(str(row["file_path"]))
+        old_path = self.material_file_path_from_row(row)
         if not old_path.exists():
             QMessageBox.warning(self, "ファイル名変更エラー", "素材ファイルが見つかりません。")
             return
@@ -5736,7 +5907,7 @@ class MainWindow(QMainWindow):
         new_path = unique_path(old_path.with_name(f"{new_stem}{old_path.suffix}"))
         try:
             old_path.rename(new_path)
-            self.db.update_image_file_path(image_id, str(new_path))
+            self.db.update_image_file_path(image_id, self.absolute_path_to_stored(new_path))
             self.refresh_images()
             self.refresh_prompt_list()
             self.statusBar().showMessage(f"素材ファイル名を変更しました: {new_path.name}")
@@ -5760,9 +5931,9 @@ class MainWindow(QMainWindow):
         if result != QMessageBox.Yes:
             return
 
-        recycle_targets = [Path(str(row["file_path"]))]
-        thumb_path = Path(str(row["thumbnail_path"] or ""))
-        if thumb_path.exists():
+        recycle_targets = [self.material_file_path_from_row(row)]
+        thumb_path = self.material_thumb_path_from_row(row)
+        if thumb_path and thumb_path.exists():
             recycle_targets.append(thumb_path)
 
         prompt_id = int(row["prompt_id"])
@@ -5799,7 +5970,7 @@ class MainWindow(QMainWindow):
         row = self.db.get_image(image_id)
         if not row:
             return
-        path = Path(str(row["file_path"]))
+        path = self.material_file_path_from_row(row)
         if not path.exists():
             QMessageBox.warning(self, "コピーエラー", "素材ファイルが見つかりません。")
             return
@@ -5815,7 +5986,7 @@ class MainWindow(QMainWindow):
         row = self.db.get_image(image_id)
         if not row:
             return
-        path = Path(str(row["file_path"]))
+        path = self.material_file_path_from_row(row)
         if not path.exists():
             QMessageBox.warning(self, "プロパティ表示エラー", "素材ファイルが見つかりません。")
             return
@@ -5869,7 +6040,7 @@ class MainWindow(QMainWindow):
         row = self.db.get_image(image_id)
         if not row:
             return
-        path = Path(str(row["file_path"]))
+        path = self.material_file_path_from_row(row)
         if path.suffix.lower() in SUPPORTED_IMAGE_EXTS:
             self.open_image_viewer(path)
         else:
@@ -6062,6 +6233,7 @@ class MainWindow(QMainWindow):
             ("新規", "Ctrl+N"),
             ("検索", "Ctrl+F"),
             ("再読み込み", "F5"),
+            ("クリップボードから素材へ貼り付け", "Alt+V"),
             ("プロンプトをコピー", "Alt+C"),
             ("終了", "Ctrl+Q"),
             ("メインウィンドウ表示", "Shift+Alt+A ※有効時"),
