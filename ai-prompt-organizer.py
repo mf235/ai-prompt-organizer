@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-AI Prompt Organizer v108
+AI Prompt Organizer v110
 
 AI生成用プロンプトを、タイトル・タグ・説明・画像付きで管理するローカルGUIツール。
 PySide6 + SQLite で動作します。
@@ -75,7 +75,7 @@ except Exception as exc:  # pragma: no cover - 実行環境向けメッセージ
 
 
 APP_NAME = "AI Prompt Organizer"
-APP_VERSION = "v1.25.4"
+APP_VERSION = "v1.27.0"
 APP_AUTHOR = "MF235"
 APP_CONTACT_X = "https://x.com/MF235XBR"
 APP_REPOSITORY = "https://github.com/mf235/ai-prompt-organizer"
@@ -1163,6 +1163,21 @@ class PromptListWidget(QListWidget):
         self.setDropIndicatorShown(False)
         self.setDefaultDropAction(Qt.CopyAction)
 
+    def keyPressEvent(self, event):  # noqa: N802 - Qt naming
+        modifiers = event.modifiers()
+        if event.key() == Qt.Key_Delete and modifiers in (Qt.NoModifier, Qt.KeypadModifier):
+            item = self.currentItem()
+            if item is not None:
+                try:
+                    target_prompt_id = int(item.data(Qt.UserRole))
+                except Exception:
+                    target_prompt_id = None
+                if target_prompt_id is not None and self.main_window.current_prompt_id == target_prompt_id:
+                    self.main_window.delete_current_prompt()
+                    event.accept()
+                    return
+        super().keyPressEvent(event)
+
     def event_local_pos(self, event) -> QPoint:
         if hasattr(event, "position"):
             return event.position().toPoint()
@@ -1495,11 +1510,28 @@ class ImageListWidget(QListWidget):
         self._internal_reorder_done = False
 
     def keyPressEvent(self, event):  # noqa: N802 - Qt naming
+        modifiers = event.modifiers()
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space) and modifiers in (Qt.NoModifier, Qt.KeypadModifier):
+            self.main_window.open_selected_image()
+            event.accept()
+            return
+        if event.key() == Qt.Key_C and modifiers == Qt.ControlModifier:
+            self.main_window.copy_selected_material_to_clipboard()
+            event.accept()
+            return
+        if event.key() == Qt.Key_V and modifiers == Qt.ControlModifier:
+            self.main_window.paste_material_from_clipboard()
+            event.accept()
+            return
+        if event.key() == Qt.Key_Delete and modifiers in (Qt.NoModifier, Qt.KeypadModifier):
+            self.main_window.remove_selected_image()
+            event.accept()
+            return
         if event.key() == Qt.Key_F2:
             self.main_window.rename_selected_image()
             event.accept()
             return
-        if event.modifiers() in (Qt.NoModifier, Qt.KeypadModifier):
+        if modifiers in (Qt.NoModifier, Qt.KeypadModifier):
             key = event.key()
             if Qt.Key_1 <= key <= Qt.Key_9:
                 self.main_window.set_selected_material_label(key - Qt.Key_0)
@@ -4880,6 +4912,8 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         pin_action = menu.addAction("ピン留め解除" if is_pinned else "ピン留め")
         menu.addSeparator()
+        open_assets_action = menu.addAction("素材フォルダを開く")
+        menu.addSeparator()
         copy_action = menu.addAction("プロンプトをコピー")
         copy_full_action = menu.addAction("タイトル+プロンプトをコピー")
         menu.addSeparator()
@@ -4888,6 +4922,8 @@ class MainWindow(QMainWindow):
         selected = menu.exec(source_list.viewport().mapToGlobal(pos))
         if selected == pin_action:
             self.toggle_prompt_pinned(target_id, not is_pinned)
+        elif selected == open_assets_action:
+            self.open_prompt_asset_folder(target_id)
         elif selected == copy_action:
             self.copy_prompt()
         elif selected == copy_full_action:
@@ -6071,6 +6107,7 @@ class MainWindow(QMainWindow):
         self.image_list.setCurrentItem(item)
         menu = QMenu(self)
         open_action = menu.addAction("開く")
+        reveal_action = menu.addAction("エクスプローラーで表示")
         copy_action = menu.addAction("コピー")
         add_new_card_action = menu.addAction("新規カードを作って追加")
         rename_action = menu.addAction("ファイル名の変更")
@@ -6089,6 +6126,8 @@ class MainWindow(QMainWindow):
         selected = menu.exec(self.image_list.viewport().mapToGlobal(pos))
         if selected == open_action:
             self.open_selected_image()
+        elif selected == reveal_action:
+            self.reveal_selected_material_in_explorer()
         elif selected == copy_action:
             self.copy_selected_material_to_clipboard()
         elif selected == add_new_card_action:
@@ -6103,6 +6142,19 @@ class MainWindow(QMainWindow):
             self.remove_selected_image()
         elif selected == property_action:
             self.show_selected_material_properties()
+
+    def reveal_selected_material_in_explorer(self) -> None:
+        image_id = self.selected_image_id()
+        if image_id is None:
+            return
+        row = self.db.get_image(image_id)
+        if not row:
+            return
+        path = self.material_file_path_from_row(row)
+        if not path.exists():
+            QMessageBox.warning(self, "表示エラー", "素材ファイルが見つかりません。")
+            return
+        reveal_path_in_file_manager(path)
 
     def open_selected_image(self) -> None:
         image_id = self.selected_image_id()
@@ -6283,13 +6335,16 @@ class MainWindow(QMainWindow):
         self.assets_dir.mkdir(parents=True, exist_ok=True)
         open_path(self.assets_dir)
 
+    def open_prompt_asset_folder(self, prompt_id: int) -> None:
+        prompt_dir = self.prompt_asset_dir(prompt_id)
+        prompt_dir.mkdir(parents=True, exist_ok=True)
+        open_path(prompt_dir)
+
     def open_current_prompt_asset_folder(self) -> None:
         if self.current_prompt_id is None:
             self.open_assets_folder()
             return
-        prompt_dir = self.prompt_asset_dir(self.current_prompt_id)
-        prompt_dir.mkdir(parents=True, exist_ok=True)
-        open_path(prompt_dir)
+        self.open_prompt_asset_folder(self.current_prompt_id)
 
     def open_readme_file(self) -> None:
         readme_path = get_base_dir() / "readme.txt"
@@ -6308,8 +6363,13 @@ class MainWindow(QMainWindow):
             ("プロンプトをコピー", "Alt+C"),
             ("終了", "Ctrl+Q"),
             ("メインウィンドウ表示", "Shift+Alt+A ※有効時"),
+            ("素材 コピー", "Ctrl+C"),
+            ("素材 貼り付け", "Ctrl+V / Alt+V"),
+            ("素材 開く", "Enter / Space"),
+            ("素材 削除", "Del"),
             ("素材 ファイル名変更", "F2"),
             ("素材 ラベル設定", "0-9"),
+            ("カード 削除", "Del"),
             ("画像ビュアー 前面表示", "Alt+Z"),
             ("画像ビュアー 並べて表示", "Alt+A"),
             ("画像ビュアー 全て閉じる", "Alt+X"),
@@ -6983,6 +7043,19 @@ def show_file_properties(path: Path) -> bool:
             return False
     open_path(path.parent)
     return True
+
+
+def reveal_path_in_file_manager(path: Path) -> None:
+    path = path.resolve()
+    try:
+        if sys.platform.startswith("win"):
+            subprocess.Popen(["explorer", f"/select,{str(path)}"])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", str(path)])
+        else:
+            open_path(path.parent if path.is_file() else path)
+    except Exception:
+        open_path(path.parent if path.is_file() else path)
 
 
 def open_path(path: Path) -> None:

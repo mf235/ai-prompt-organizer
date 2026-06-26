@@ -47,14 +47,14 @@ AI生成用のプロンプトを、タイトル・タグ・説明・評価・素
 
 1. **アプリをダウンロードする**
 
-   [AI Prompt Organizer v1.25.4](https://github.com/mf235/ai-prompt-organizer/releases/tag/v1.25.4)
+   [AI Prompt Organizer v1.27.0](https://github.com/mf235/ai-prompt-organizer/releases/tag/v1.27.0)
 
    GitHubの **Releases** から最新版のZIPファイルをダウンロードします。
 
    例:
 
    ```text
-   ai-prompt-organizer-v1.25.4.zip
+   ai-prompt-organizer-v1.27.0.zip
    ```
 
    ダウンロードしたZIPを好きな場所に展開してください。
