@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-AI Prompt Organizer v107
+AI Prompt Organizer v108
 
 AI生成用プロンプトを、タイトル・タグ・説明・画像付きで管理するローカルGUIツール。
 PySide6 + SQLite で動作します。
@@ -19,6 +19,7 @@ import os
 import re
 import shutil
 import sqlite3
+import tempfile
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -74,7 +75,7 @@ except Exception as exc:  # pragma: no cover - 実行環境向けメッセージ
 
 
 APP_NAME = "AI Prompt Organizer"
-APP_VERSION = "v1.25.3"
+APP_VERSION = "v1.25.4"
 APP_AUTHOR = "MF235"
 APP_CONTACT_X = "https://x.com/MF235XBR"
 APP_REPOSITORY = "https://github.com/mf235/ai-prompt-organizer"
@@ -5401,13 +5402,26 @@ class MainWindow(QMainWindow):
         except Exception:
             return None
 
-    def capture_video_frame(self, src: Path):
+    def windows_short_path(self, path: Path) -> Optional[str]:
+        if os.name != "nt":
+            return None
         try:
-            import cv2  # type: ignore
-        except Exception as exc:
-            raise RuntimeError("動画サムネ生成には opencv-python が必要です。") from exc
+            import ctypes
+            from ctypes import wintypes
 
-        cap = cv2.VideoCapture(str(src))
+            get_short_path_name = ctypes.windll.kernel32.GetShortPathNameW
+            get_short_path_name.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+            get_short_path_name.restype = wintypes.DWORD
+            buffer = ctypes.create_unicode_buffer(32768)
+            result = get_short_path_name(str(path), buffer, len(buffer))
+            if 0 < result < len(buffer):
+                return buffer.value
+        except Exception:
+            pass
+        return None
+
+    def capture_video_frame_from_cv2_path(self, cv2, path_text: str):
+        cap = cv2.VideoCapture(path_text)
         if not cap.isOpened():
             cap.release()
             raise RuntimeError("動画を開けませんでした。")
@@ -5434,10 +5448,71 @@ class MainWindow(QMainWindow):
                     break
 
             if frame is None:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                for _ in range(30):
+                    ok, current = cap.read()
+                    if ok and current is not None:
+                        frame = current
+                        break
+
+            if frame is None:
                 raise RuntimeError("動画からフレームを取得できませんでした。")
             return frame
         finally:
             cap.release()
+
+    def capture_video_frame(self, src: Path):
+        try:
+            import cv2  # type: ignore
+        except Exception as exc:
+            raise RuntimeError("動画サムネ生成には opencv-python が必要です。") from exc
+
+        errors: list[str] = []
+        candidates: list[str] = []
+
+        def add_candidate(value: Optional[str]) -> None:
+            if value and value not in candidates:
+                candidates.append(value)
+
+        add_candidate(str(src))
+        add_candidate(self.windows_short_path(src))
+        for candidate in candidates:
+            try:
+                return self.capture_video_frame_from_cv2_path(cv2, candidate)
+            except Exception as exc:
+                errors.append(str(exc))
+
+        # OpenCV can fail on some Windows paths, especially with non-ASCII names.
+        # Retry from an ASCII file name in a temporary folder before giving up.
+        suffix = src.suffix if src.suffix else ".mp4"
+        try:
+            with tempfile.TemporaryDirectory(prefix="apo_video_") as tmp_dir:
+                temp_path = Path(tmp_dir) / f"source{suffix.lower()}"
+                shutil.copy2(src, temp_path)
+                temp_candidates: list[str] = []
+                for value in (str(temp_path), self.windows_short_path(temp_path)):
+                    if value and value not in temp_candidates:
+                        temp_candidates.append(value)
+                for candidate in temp_candidates:
+                    try:
+                        return self.capture_video_frame_from_cv2_path(cv2, candidate)
+                    except Exception as exc:
+                        errors.append(str(exc))
+        except Exception as exc:
+            errors.append(str(exc))
+
+        detail = errors[-1] if errors else "原因不明"
+        raise RuntimeError(f"動画からフレームを取得できませんでした。{detail}")
+
+    def write_cv2_jpeg(self, cv2, dest: Path, frame, quality: int = 90) -> None:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+        if not ok:
+            raise RuntimeError("JPEGをエンコードできませんでした。")
+        try:
+            dest.write_bytes(encoded.tobytes())
+        except Exception as exc:
+            raise RuntimeError("JPEGを書き出せませんでした。") from exc
 
     def write_video_thumbnail_jpeg(self, src: Path, dest: Path) -> None:
         try:
@@ -5460,9 +5535,7 @@ class MainWindow(QMainWindow):
         top = max(0, (canvas_h - target_h) // 2)
         bottom = max(0, canvas_h - target_h - top)
         canvas = cv2.copyMakeBorder(resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(255, 255, 255))
-        ok = cv2.imwrite(str(dest), canvas, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-        if not ok:
-            raise RuntimeError("JPEGを書き出せませんでした。")
+        self.write_cv2_jpeg(cv2, dest, canvas, quality=90)
 
     def write_video_frame_jpeg(self, src: Path, dest: Path, target_height: int = 1080) -> None:
         try:
@@ -5479,9 +5552,7 @@ class MainWindow(QMainWindow):
         if height != target_height:
             frame = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_AREA if target_height < height else cv2.INTER_CUBIC)
 
-        ok = cv2.imwrite(str(dest), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-        if not ok:
-            raise RuntimeError("JPEGを書き出せませんでした。")
+        self.write_cv2_jpeg(cv2, dest, frame, quality=90)
 
     def create_extension_thumbnail(self, src: Path, image_id: int, prompt_id: int) -> Optional[Path]:
         thumb_dir = self.prompt_thumbs_dir(prompt_id)
